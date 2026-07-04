@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# auto-loop — advance a fixed list of coding tasks SEQUENTIALLY with an agent CLI
+# (Claude Code or OpenAI Codex), automatically waiting out usage-limit windows.
+#
+# How it works:
+#   * Each task is handed to an agent CLI in NON-INTERACTIVE mode. When the agent hits
+#     the account's usage limit, the loop sleeps until the window resets, then resumes
+#     the SAME session for that task (so it continues, it does not restart).
+#       - Claude: reads the rate_limit_event.resetsAt and sleeps to that exact moment.
+#       - Codex:  no precise reset epoch is exposed, so it backs off CODEX_COOLDOWN.
+#   * Tasks run one-by-one: finish the current task (across as many windows as it takes)
+#     before starting the next.
+#   * INDEPENDENT AUDIT: when a worker claims TASK_COMPLETE, a separate fresh auditor
+#     agent must independently verify every "done" criterion before the task is marked
+#     complete (no grading-its-own-homework). Toggle with AUDIT=0.
+#   * INTERACTIVE PICKUP: every task keeps a resumable session_id, so you can jump into
+#     the normal interactive TUI at any point with `./auto-loop.sh attach <id>`.
+#   * A tiny local web UI (`./auto-loop.sh ui`) lets non-coders load tasks, watch status,
+#     and read reports — the CLI is still the engine behind it.
+#
+# Usage:
+#   ./auto-loop.sh [run]           # run the loop in the foreground
+#   ./auto-loop.sh status          # print each task's state and exit
+#   ./auto-loop.sh validate        # lint tasks.json without running anything
+#   ./auto-loop.sh edit            # open tasks.json in $EDITOR, then re-validate
+#   ./auto-loop.sh sessions        # list task -> engine -> session_id -> dir
+#   ./auto-loop.sh attach <id>     # open the INTERACTIVE agent TUI on a task's session
+#   ./auto-loop.sh report          # (re)generate a status report on demand
+#   ./auto-loop.sh ui [port]       # launch the local web UI (default 127.0.0.1:8787)
+#   ./auto-loop.sh stop            # stop a running loop (via lock file PID)
+#   nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &   # unattended background run
+#
+# Config: tasks.json (see tasks.example.json). Runtime state: state.json.
+# Logs: logs/. Reports: reports/. Lock: .auto-loop.lock.
+# Env overrides: ENGINE, MODEL, PERM_FLAGS, IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS,
+#   CLAUDE_BIN, CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT, AUDIT, AUDIT_MODEL,
+#   AUDIT_ENGINE, UI_PORT, EDITOR.
+
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TASKS="${TASKS_FILE:-$ROOT/tasks.json}"
+STATE="${STATE_FILE:-$ROOT/state.json}"
+LOGDIR="$ROOT/logs"
+REPORTDIR="$ROOT/reports"
+LOCKFILE="$ROOT/.auto-loop.lock"
+mkdir -p "$LOGDIR" "$REPORTDIR"
+
+ENGINE="${ENGINE:-claude}"             # default agent engine: claude | codex
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+MODEL="${MODEL:-}"                     # empty -> per-task model, else account default
+PERM_FLAGS="${PERM_FLAGS:---dangerously-skip-permissions}"  # claude: unattended, no prompts
+IDLE_SLEEP="${IDLE_SLEEP:-20}"         # seconds between runs, avoids hammering
+RESET_BUFFER="${RESET_BUFFER:-120}"    # extra seconds after resetsAt before retrying
+CODEX_COOLDOWN="${CODEX_COOLDOWN:-3600}"  # codex back-off when usage-limited (no reset epoch)
+MAX_ERRORS="${MAX_ERRORS:-3}"          # consecutive non-limit errors before parking a task
+REQUIRE_GIT="${REQUIRE_GIT:-1}"        # 1 => a task dir must be a git repo (worker commits)
+AUDIT="${AUDIT:-1}"                    # 1 => independent auditor must confirm TASK_COMPLETE
+AUDIT_MODEL="${AUDIT_MODEL:-}"         # model for the auditor (default: task/global/default)
+AUDIT_ENGINE="${AUDIT_ENGINE:-}"      # engine for the auditor (default: task engine)
+UI_PORT="${UI_PORT:-8787}"
+
+ts(){ date '+%F %T'; }
+log(){ printf '%s | %s\n' "$(ts)" "$*" | tee -a "$LOGDIR/main.log" >&2; }
+die(){ log "FATAL: $*"; exit 1; }
+
+command -v jq >/dev/null || die "jq not found on PATH"
+[ -f "$TASKS" ] || die "missing $TASKS — copy tasks.example.json to tasks.json and fill it in"
+
+engine_bin(){ case "$1" in claude) echo "$CLAUDE_BIN";; codex) echo "$CODEX_BIN";; *) echo "";; esac; }
+require_engine(){ local b; b="$(engine_bin "$1")"; [ -n "$b" ] || die "unknown engine: '$1' (use claude|codex)"; command -v "$b" >/dev/null || die "$1 CLI not found ($b)"; }
+
+# --- state.json helpers ------------------------------------------------------
+state_write(){ local tmp; tmp="$(mktemp)"; cat > "$tmp" && mv "$tmp" "$STATE"; }
+
+init_state(){
+  [ -f "$STATE" ] || echo '{}' > "$STATE"
+  local count id
+  count="$(jq -r '.tasks | length' "$TASKS")" || die "tasks.json: cannot read .tasks"
+  [ "$count" -gt 0 ] || die "tasks.json has no tasks"
+  while IFS= read -r id; do
+    if [ "$(jq --arg id "$id" 'has($id)' "$STATE")" != "true" ]; then
+      jq --arg id "$id" '.[$id]={status:"pending",session_id:null,runs:0,errors:0,summary:"",last:""}' "$STATE" | state_write
+    fi
+  done < <(jq -r '.tasks[].id' "$TASKS")
+}
+
+sget(){ jq -r --arg id "$1" ".[\$id].$2 // \"\"" "$STATE"; }   # sget <id> <field>
+sset(){ local id="$1"; shift; jq --arg id "$id" "$@" "$STATE" | state_write; }  # sset <id> [jq args] <filter>
+tget(){ jq -r --arg id "$1" ".tasks[]|select(.id==\$id)|.$2 // \"\"" "$TASKS"; }  # tget <id> <field>
+task_engine(){ local e; e="$(tget "$1" engine)"; [ -z "$e" ] && e="$ENGINE"; echo "$e"; }
+
+next_task(){                       # first active task in file order
+  local id st
+  while IFS= read -r id; do
+    st="$(sget "$id" status)"
+    case "$st" in pending|in_progress|review) echo "$id"; return 0;; esac
+  done < <(jq -r '.tasks[].id' "$TASKS")
+  return 1
+}
+
+# --- task-spec validation ("check the spec, adjust so it runs best") ---------
+validate_tasks(){
+  local rc=0 n i id dir goal donc eng seen=""
+  jq -e '.tasks | type=="array"' "$TASKS" >/dev/null 2>&1 || { log "VALIDATE: .tasks is not an array"; return 1; }
+  n="$(jq -r '.tasks | length' "$TASKS")"
+  [ "$n" -gt 0 ] || { log "VALIDATE: tasks.json has no tasks"; return 1; }
+  for ((i=0; i<n; i++)); do
+    id="$(jq -r ".tasks[$i].id // \"\"" "$TASKS")"
+    dir="$(jq -r ".tasks[$i].dir // \"\"" "$TASKS")"
+    goal="$(jq -r ".tasks[$i].goal // \"\"" "$TASKS")"
+    donc="$(jq -r ".tasks[$i].done // \"\"" "$TASKS")"
+    eng="$(jq -r ".tasks[$i].engine // \"\"" "$TASKS")"
+    if [ -z "$id" ]; then log "VALIDATE[#$i]: missing id"; rc=1; continue; fi
+    [[ "$id" =~ ^[a-z0-9-]+$ ]] || { log "VALIDATE[$id]: id should match ^[a-z0-9-]+$ (slug)"; rc=1; }
+    case " $seen " in *" $id "*) log "VALIDATE[$id]: duplicate id"; rc=1;; esac
+    seen="$seen $id"
+    [ -n "$goal" ] || { log "VALIDATE[$id]: empty goal"; rc=1; }
+    [ -n "$donc" ] || { log "VALIDATE[$id]: empty done-criteria"; rc=1; }
+    case "$eng" in ""|claude|codex) : ;; *) log "VALIDATE[$id]: engine must be claude|codex, got '$eng'"; rc=1;; esac
+    if [ -z "$dir" ]; then log "VALIDATE[$id]: empty dir"; rc=1
+    else
+      case "$dir" in /*) : ;; *) log "VALIDATE[$id]: dir must be an absolute path: '$dir'"; rc=1;; esac
+      if [ ! -d "$dir" ]; then log "VALIDATE[$id]: dir does not exist: '$dir'"; rc=1
+      elif [ ! -d "$dir/.git" ] && ! ( cd "$dir" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+        if [ "$REQUIRE_GIT" = "1" ]; then log "VALIDATE[$id]: dir is not a git repo (worker must commit): '$dir'"; rc=1
+        else log "VALIDATE[$id]: WARN dir is not a git repo: '$dir'"; fi
+      fi
+    fi
+    printf '%s\n' "$donc" | grep -qiE '(npm|pnpm|yarn|pytest|uv |cargo|go test|make|build|test|passes|exit 0|http)' \
+      || log "VALIDATE[$id]: WARN done-criteria has no obvious checkable command/artifact"
+  done
+  return "$rc"
+}
+
+detect_repo_hint(){
+  local dir="$1" h=""
+  [ -f "$dir/package.json" ]   && h="$h; node/npm (inspect package.json scripts for build/test)"
+  { [ -f "$dir/pyproject.toml" ] || [ -f "$dir/uv.lock" ]; } && h="$h; python (try: uv run pytest -q)"
+  [ -f "$dir/requirements.txt" ] && h="$h; python (pip/requirements.txt)"
+  [ -f "$dir/Cargo.toml" ]     && h="$h; rust (cargo build && cargo test)"
+  [ -f "$dir/go.mod" ]         && h="$h; go (go build ./... && go test ./...)"
+  [ -f "$dir/Makefile" ]       && h="$h; make (check targets: build/test)"
+  [ -n "$h" ] && printf 'Detected in this repo:%s.' "${h# ; }"
+}
+
+# --- lock --------------------------------------------------------------------
+loop_pid(){ [ -f "$LOCKFILE" ] && cat "$LOCKFILE" 2>/dev/null; }
+loop_running(){ local p; p="$(loop_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
+acquire_lock(){ if loop_running; then die "another auto-loop is already running (PID $(loop_pid)). Use './auto-loop.sh stop' first."; fi; echo "$$" > "$LOCKFILE"; trap 'release_lock' EXIT INT TERM; }
+release_lock(){ [ -f "$LOCKFILE" ] && [ "$(cat "$LOCKFILE" 2>/dev/null)" = "$$" ] && rm -f "$LOCKFILE"; }
+
+# --- low-level engine call ---------------------------------------------------
+# llm_run <engine> <dir> <sid> <model> <instructions> <nudge> <outfile>
+# Sets: LLM_TEXT LLM_SID LLM_EC LLM_RL(allowed|rejected) LLM_RESETS LLM_ERR(true|false)
+LLM_TEXT="" LLM_SID="" LLM_EC=0 LLM_RL="allowed" LLM_RESETS="" LLM_ERR="false"
+llm_run(){
+  local engine="$1" dir="$2" sid="$3" model="$4" instr="$5" nudge="$6" out="$7"
+  LLM_TEXT="" LLM_SID="" LLM_EC=0 LLM_RL="allowed" LLM_RESETS="" LLM_ERR="false"
+  if [ "$engine" = "claude" ]; then
+    local -a a=(-p "$nudge" --output-format json --add-dir "$dir" --append-system-prompt "$instr")
+    # shellcheck disable=SC2206
+    a+=($PERM_FLAGS)
+    [ -n "$model" ] && a+=(--model "$model")
+    [ -n "$sid" ] && [ "$sid" != "null" ] && a+=(--resume "$sid")
+    ( cd "$dir" && "$CLAUDE_BIN" "${a[@]}" ) > "$out" 2>&1 </dev/null; LLM_EC=$?
+    LLM_RL="$(jq -r 'try (.[]|select(.type=="rate_limit_event")|.rate_limit_info.status) catch empty' "$out" 2>/dev/null | tail -1)"; [ -z "$LLM_RL" ] && LLM_RL="allowed"
+    LLM_RESETS="$(jq -r 'try (.[]|select(.type=="rate_limit_event")|.rate_limit_info.resetsAt) catch empty' "$out" 2>/dev/null | tail -1)"
+    LLM_TEXT="$(jq -r 'try (.[]|select(.type=="result")|.result)   catch empty' "$out" 2>/dev/null | tail -1)"
+    LLM_SID="$(jq -r 'try (.[]|select(.type=="result")|.session_id) catch empty' "$out" 2>/dev/null | tail -1)"
+    [ "$(jq -r 'try (.[]|select(.type=="result")|.is_error) catch empty' "$out" 2>/dev/null | tail -1)" = "true" ] && LLM_ERR="true"
+  else  # codex
+    local last="$out.last"; : > "$last"
+    local prompt="$instr
+
+$nudge"
+    local -a a=()
+    if [ -n "$sid" ] && [ "$sid" != "null" ]; then a=(exec resume "$sid" --json --dangerously-bypass-approvals-and-sandbox -o "$last")
+    else a=(exec --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check -o "$last"); fi
+    [ -n "$model" ] && a+=(-m "$model")
+    ( cd "$dir" && "$CODEX_BIN" "${a[@]}" "$prompt" ) > "$out" 2>&1 </dev/null; LLM_EC=$?
+    LLM_SID="$(grep -m1 -oE '"thread_id":"[0-9a-fA-F-]+"' "$out" 2>/dev/null | head -1 | sed 's/.*:"//;s/"$//')"
+    [ -s "$last" ] && LLM_TEXT="$(cat "$last")"
+    if grep -qiE 'rate limit|usage limit|reached your usage|too many requests|429|quota|please try again later' "$out" "$last" 2>/dev/null; then LLM_RL="rejected"; fi
+    [ "$LLM_EC" -ne 0 ] && [ "$LLM_RL" = "allowed" ] && LLM_ERR="true"
+  fi
+}
+
+# --- one worker run ----------------------------------------------------------
+RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT="" CUR_ENGINE=""
+
+run_task(){
+  local id="$1" dir goal donc sid runs model engine hint
+  dir="$(tget "$id" dir)"; goal="$(tget "$id" goal)"; donc="$(tget "$id" done)"
+  engine="$(task_engine "$id")"; CUR_ENGINE="$engine"
+  RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT=""
+  if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+    log "[$id] dir missing or not found: '$dir' — parking as error"
+    sset "$id" --arg d "$dir" '.[$id].status="error"|.[$id].summary=("dir not found: "+$d)'; return 1
+  fi
+  if [ "$REQUIRE_GIT" = "1" ] && [ ! -d "$dir/.git" ] && ! ( cd "$dir" && git rev-parse --git-dir >/dev/null 2>&1 ); then
+    log "[$id] dir is not a git repo but worker must commit: '$dir' — parking (set REQUIRE_GIT=0 to override)"
+    sset "$id" --arg d "$dir" '.[$id].status="error"|.[$id].summary=("not a git repo: "+$d)'; return 1
+  fi
+  require_engine "$engine"
+  sid="$(sget "$id" session_id)"; runs="$(sget "$id" runs)"
+  model="$(tget "$id" model)"; [ -z "$model" ] && model="$MODEL"
+  hint="$(detect_repo_hint "$dir")"
+
+  local instr="You are an unattended coding agent advancing ONE task by a bounded, safe increment. No human is watching this run.
+TASK: $goal
+DONE WHEN: $donc
+${hint:+REPO HINT: $hint}
+Rules: edit only inside $dir; you may read explicitly referenced plan/context files outside $dir. Make real progress and COMMIT it on a feature branch; inspect git status before editing and before committing; do not stage unrelated pre-existing changes or untracked files. NEVER touch main/master, NEVER force-push, NEVER merge; never write or print secret values; keep the repo runnable. Do not wait for input — if a choice is needed, take the most reasonable option and record it. Keep each run to one coherent chunk; you will be invoked again to continue. An INDEPENDENT auditor will verify your work, so do not claim completion unless every done-criterion is objectively met.
+Finish your FINAL message with EXACTLY ONE sentinel line:
+TASK_COMPLETE — every done-criterion is met and you verified it
+TASK_BLOCKED: <one-line reason> — you cannot proceed without a human decision/credential
+TASK_PROGRESS: <one-line summary of what you did this run> — otherwise"
+  local nudge="Advance this task by one meaningful, safe increment now. First inspect the current state (git status/log, recent files) so you continue rather than restart. Do the next chunk, verify it, commit on a branch. Then output your single sentinel line."
+
+  local out="$LOGDIR/${id}-$(date +%Y%m%d-%H%M%S).json"; RUN_OUT="$out"
+  log "[$id] run #$((runs+1)) via $engine in $dir${model:+ model=$model}"
+  llm_run "$engine" "$dir" "$sid" "$model" "$instr" "$nudge" "$out"
+  RL_STATUS="$LLM_RL"; RESETS_AT="$LLM_RESETS"; IS_ERROR="$LLM_ERR"; RESULT_TEXT="$LLM_TEXT"; SESSION_ID="$LLM_SID"
+  log "[$id] exit=$LLM_EC rate_limit=$RL_STATUS is_error=$IS_ERROR"
+}
+
+limited(){
+  [ "$RL_STATUS" = "rejected" ] && return 0
+  [ -n "$RUN_OUT" ] && [ -f "$RUN_OUT" ] && [ "$RL_STATUS" != "allowed" ] && grep -qiE 'usage limit reached|rate limit|limit will reset|resets? at' "$RUN_OUT" && return 0
+  return 1
+}
+
+resolve_reset_epoch(){
+  local e="$RESETS_AT"
+  [[ "$e" =~ ^[0-9]+$ ]] || e="$(grep -oE '[0-9]{10}' "$RUN_OUT" 2>/dev/null | tail -1)"
+  if ! [[ "$e" =~ ^[0-9]+$ ]]; then
+    if [ "$CUR_ENGINE" = "codex" ]; then e=$(( $(date +%s) + CODEX_COOLDOWN )); log "codex: no reset epoch; backing off ${CODEX_COOLDOWN}s"
+    else e=$(( $(date +%s) + 5*3600 )); log "no resetsAt found; defaulting to +5h"; fi
+  fi
+  echo "$e"
+}
+
+sleep_until_reset(){
+  local epoch now target wait
+  epoch="$(resolve_reset_epoch)"; now="$(date +%s)"; target=$(( epoch + RESET_BUFFER )); wait=$(( target - now ))
+  [ "$wait" -lt 30 ] && wait=30
+  log "LIMITED — sleeping ${wait}s (~$(( wait/60 ))m) until $(date -r "$target" '+%F %T %Z')"
+  sleep "$wait"
+}
+
+# --- independent auditor -----------------------------------------------------
+AUDIT_VERDICT="" AUDIT_REASON=""
+run_audit(){
+  local id="$1" dir donc engine model out line
+  dir="$(tget "$id" dir)"; donc="$(tget "$id" done)"
+  engine="$AUDIT_ENGINE"; [ -z "$engine" ] && engine="$(task_engine "$id")"
+  model="$AUDIT_MODEL"; [ -z "$model" ] && { model="$(tget "$id" model)"; [ -z "$model" ] && model="$MODEL"; }
+  CUR_ENGINE="$engine"; AUDIT_VERDICT=""; AUDIT_REASON=""
+  require_engine "$engine"
+
+  local instr="You are an INDEPENDENT completion auditor. A previous agent claims this task is done; do NOT trust that claim — verify it yourself, objectively and skeptically.
+DONE WHEN (the ONLY thing that matters): $donc
+Working dir: $dir
+Verify EVERY criterion yourself: inspect git (status, log, and the diff on the feature branch), read the actually-changed files, and RUN the exact verification commands named in DONE WHEN (build/test/etc.) to confirm they pass right now. You MAY run commands to verify. You MUST NOT edit files, create/switch/commit branches, push, or change any state — verification only. If a required check cannot be run, or ANY criterion is unmet, ambiguous, or unverifiable, that is a FAIL.
+Finish with EXACTLY ONE line:
+AUDIT_PASS — every criterion objectively verified just now
+AUDIT_FAIL: <one-line reason naming the unmet or unverifiable criterion>"
+  local nudge="Audit this task now against DONE WHEN. Run the checks yourself. Output your single AUDIT_ line."
+
+  out="$LOGDIR/${id}-audit-$(date +%Y%m%d-%H%M%S).json"; RUN_OUT="$out"
+  log "[$id] AUDIT via $engine${model:+ model=$model}"
+  llm_run "$engine" "$dir" "" "$model" "$instr" "$nudge" "$out"
+  RL_STATUS="$LLM_RL"; RESETS_AT="$LLM_RESETS"
+  if [ "$LLM_RL" = "rejected" ]; then AUDIT_VERDICT="ratelimited"; return; fi
+  line="$(printf '%s\n' "$LLM_TEXT" | grep -oE 'AUDIT_(PASS|FAIL).*' | tail -1)"
+  case "$line" in
+    AUDIT_PASS*) AUDIT_VERDICT="pass"; AUDIT_REASON="$line";;
+    AUDIT_FAIL*) AUDIT_VERDICT="fail"; AUDIT_REASON="$line";;
+    *)           AUDIT_VERDICT="inconclusive"; AUDIT_REASON="auditor emitted no AUDIT_ sentinel";;
+  esac
+  log "[$id] AUDIT verdict=$AUDIT_VERDICT — ${AUDIT_REASON:0:80}"
+}
+
+# handle a task in 'review' state: audit it, then decide its fate
+do_review(){
+  local id="$1"
+  if [ "$AUDIT" != "1" ]; then sset "$id" '.[$id].status="complete"'; log "[$id] COMPLETE (audit disabled)"; return; fi
+  run_audit "$id"
+  case "$AUDIT_VERDICT" in
+    pass)         sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="complete"|.[$id].summary=("AUDITED ✓ "+$l)'; log "[$id] COMPLETE (audit passed)";;
+    fail)         sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="in_progress"|.[$id].summary=("AUDIT FAILED: "+$l)'; log "[$id] audit FAILED — back to in_progress";;
+    ratelimited)  write_report "audit-rate-limit" >/dev/null; sleep_until_reset;;   # stay 'review', retry
+    *)            sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="in_progress"|.[$id].summary=("AUDIT INCONCLUSIVE: "+$l)'; log "[$id] audit inconclusive — back to in_progress";;
+  esac
+}
+
+apply_result(){
+  local id="$1" line
+  if [ "$(sget "$id" session_id)" = "" ] || [ "$(sget "$id" session_id)" = "null" ]; then
+    [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && sset "$id" --arg s "$SESSION_ID" '.[$id].session_id=$s'
+  fi
+  sset "$id" --arg t "$(ts)" '.[$id].runs=(.[$id].runs+1)|.[$id].last=$t'
+  if [ "$IS_ERROR" = "true" ]; then
+    local n; n=$(( $(sget "$id" errors) + 1 ))
+    sset "$id" --argjson n "$n" '.[$id].errors=$n'
+    if [ "$n" -ge "$MAX_ERRORS" ]; then sset "$id" '.[$id].status="error"'; log "[$id] error x$n — parking task"
+    else log "[$id] error x$n — will retry next pass"; fi
+    return
+  fi
+  sset "$id" '.[$id].errors=0'
+  line="$(printf '%s\n' "$RESULT_TEXT" | grep -oE 'TASK_(COMPLETE|BLOCKED|PROGRESS).*' | tail -1)"
+  case "$line" in
+    TASK_COMPLETE*) sset "$id" --arg l "$line" '.[$id].status="review"|.[$id].summary=$l'; log "[$id] worker claims COMPLETE — queued for audit";;
+    TASK_BLOCKED*)  sset "$id" --arg l "$line" '.[$id].status="blocked"|.[$id].summary=$l';  log "[$id] BLOCKED — $line";;
+    *)              sset "$id" --arg l "${line:-TASK_PROGRESS: (no sentinel emitted)}" '.[$id].status="in_progress"|.[$id].summary=$l'; log "[$id] progress — ${line:-<none>}";;
+  esac
+}
+
+# --- reports -----------------------------------------------------------------
+write_report(){
+  local reason="${1:-manual}" f id st runs errs last summ dir eng
+  f="$REPORTDIR/report-$(date +%Y%m%d-%H%M%S).md"
+  {
+    printf '# auto-loop report\n\n- Generated: %s\n- Trigger: %s\n- Tasks file: `%s`\n\n' "$(ts)" "$reason" "$TASKS"
+    printf '## Task status\n\n| task | engine | status | runs | err | last | summary |\n|------|--------|--------|------|-----|------|---------|\n'
+    while IFS= read -r id; do
+      st="$(sget "$id" status)"; runs="$(sget "$id" runs)"; errs="$(sget "$id" errors)"
+      last="$(sget "$id" last)"; eng="$(task_engine "$id")"; summ="$(sget "$id" summary | tr '|' '/' | cut -c1-90)"
+      printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$id" "$eng" "$st" "$runs" "$errs" "${last:-–}" "${summ:-–}"
+    done < <(jq -r '.tasks[].id' "$TASKS")
+    printf '\n## Recent commits per task repo\n\n'
+    while IFS= read -r id; do
+      dir="$(tget "$id" dir)"; printf '### %s — `%s`\n' "$id" "$dir"
+      if [ -d "$dir/.git" ] || ( cd "$dir" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1 ); then
+        printf '```\n'; ( cd "$dir" && git log --oneline -5 2>/dev/null ); printf '```\n\n'
+      else printf '_not a git repo_\n\n'; fi
+    done < <(jq -r '.tasks[].id' "$TASKS")
+    printf '\n_Logs: `%s`  •  transcripts: `%s/<task>-<ts>.json`  •  audits: `%s/<task>-audit-<ts>.json`_\n' "$LOGDIR/main.log" "$LOGDIR" "$LOGDIR"
+  } > "$f"
+  log "report written: $f ($reason)"; echo "$f"
+}
+
+# --- subcommands -------------------------------------------------------------
+cmd_status(){
+  init_state
+  printf '\n%-24s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE STATUS RUNS ERR SUMMARY
+  printf '%-24s %-7s %-12s %-5s %-4s %s\n' ------------------------ ------- ------------ ----- ---- -------
+  local id
+  while IFS= read -r id; do
+    printf '%-24s %-7s %-12s %-5s %-4s %s\n' "$id" "$(task_engine "$id")" "$(sget "$id" status)" "$(sget "$id" runs)" "$(sget "$id" errors)" "$(sget "$id" summary)"
+  done < <(jq -r '.tasks[].id' "$TASKS")
+  loop_running && printf '\nloop: RUNNING (PID %s)\n\n' "$(loop_pid)" || printf '\nloop: not running\n\n'
+}
+
+cmd_validate(){ if validate_tasks; then log "validate: OK"; echo "tasks.json OK"; else die "validate: tasks.json has hard errors (see above)"; fi; }
+cmd_edit(){ local ed="${EDITOR:-vi}"; "$ed" "$TASKS" || die "editor exited nonzero"; jq -e . "$TASKS" >/dev/null 2>&1 || die "tasks.json is no longer valid JSON"; cmd_validate; }
+
+cmd_sessions(){
+  init_state
+  printf '\n%-24s %-7s %-12s %-38s %s\n' TASK ENGINE STATUS SESSION_ID DIR
+  local id sid st dir
+  while IFS= read -r id; do
+    st="$(sget "$id" status)"; sid="$(sget "$id" session_id)"; dir="$(tget "$id" dir)"
+    printf '%-24s %-7s %-12s %-38s %s\n' "$id" "$(task_engine "$id")" "$st" "${sid:-–}" "$dir"
+  done < <(jq -r '.tasks[].id' "$TASKS")
+  printf '\nResume any task interactively:  ./auto-loop.sh attach <task>\n\n'
+}
+
+cmd_attach(){
+  init_state
+  local id="${1:-}" dir sid engine bin ans
+  [ -n "$id" ] || die "usage: ./auto-loop.sh attach <task-id>  (see: ./auto-loop.sh sessions)"
+  jq -e --arg id "$id" '.tasks[]|select(.id==$id)' "$TASKS" >/dev/null 2>&1 || die "no such task: $id"
+  dir="$(tget "$id" dir)"; sid="$(sget "$id" session_id)"; engine="$(task_engine "$id")"; bin="$(engine_bin "$engine")"
+  [ -d "$dir" ] || die "task dir not found: $dir"
+  require_engine "$engine"
+  if loop_running; then
+    log "WARNING: the loop is RUNNING (PID $(loop_pid)). Attaching now can fork this task's session."
+    printf 'The loop is running. Stop it first for a clean handoff: ./auto-loop.sh stop\nAttach anyway? [y/N] '
+    read -r ans; case "$ans" in y|Y) : ;; *) die "aborted";; esac
+  fi
+  if [ -n "$sid" ] && [ "$sid" != "null" ]; then
+    log "[$id] attaching interactively ($engine) to session $sid in $dir"
+    if [ "$engine" = "claude" ]; then ( cd "$dir" && exec "$bin" --resume "$sid" )
+    else ( cd "$dir" && exec "$bin" resume "$sid" ); fi
+  else
+    log "[$id] no session yet — starting a fresh interactive $engine session in $dir"
+    ( cd "$dir" && exec "$bin" )
+  fi
+}
+
+cmd_stop(){ if loop_running; then local p; p="$(loop_pid)"; log "stopping loop PID $p"; kill "$p" 2>/dev/null && sleep 1; kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null; rm -f "$LOCKFILE"; echo "stopped"; else echo "no running loop"; fi; }
+cmd_report(){ init_state; write_report manual; }
+cmd_ui(){ local port="${1:-$UI_PORT}"; command -v python3 >/dev/null || die "python3 not found (needed for the web UI)"; log "UI on http://127.0.0.1:$port (Ctrl-C to stop)"; exec python3 "$ROOT/ui-server.py" "$port"; }
+
+main(){
+  init_state
+  validate_tasks || die "tasks.json has hard errors — fix them or run ./auto-loop.sh validate (set REQUIRE_GIT=0 to allow non-git dirs)"
+  acquire_lock
+  [ "$PERM_FLAGS" = "--dangerously-skip-permissions" ] && log "NOTE: claude runs with --dangerously-skip-permissions; codex runs with --dangerously-bypass-approvals-and-sandbox. Workers act unattended inside each task dir."
+  [ "$AUDIT" = "1" ] && log "AUDIT: on — an independent agent must confirm each TASK_COMPLETE" || log "AUDIT: OFF — completion is self-attested"
+  log "=== auto-loop start === engine=$ENGINE tasks=$(jq -r '[.tasks[].id]|join(",")' "$TASKS")"
+  while :; do
+    local id st
+    if ! id="$(next_task)"; then log "=== no active tasks left — stopping ==="; write_report "loop-idle" >/dev/null; cmd_status; break; fi
+    st="$(sget "$id" status)"
+    if [ "$st" = "review" ]; then do_review "$id"; sleep "$IDLE_SLEEP"; continue; fi
+    if ! run_task "$id"; then sleep "$IDLE_SLEEP"; continue; fi
+    if limited; then write_report "rate-limit-window-end" >/dev/null; sleep_until_reset; continue; fi
+    apply_result "$id"
+    sleep "$IDLE_SLEEP"
+  done
+}
+
+case "${1:-run}" in
+  run)      main;;
+  status)   cmd_status;;
+  validate) cmd_validate;;
+  edit)     cmd_edit;;
+  sessions) cmd_sessions;;
+  attach)   shift; cmd_attach "${1:-}";;
+  report)   cmd_report;;
+  ui)       shift; cmd_ui "${1:-}";;
+  stop)     cmd_stop;;
+  *)        die "unknown arg: '$1' (use: run | status | validate | edit | sessions | attach <id> | report | ui | stop)";;
+esac

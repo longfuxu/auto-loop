@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "id": "task-1",
+      "dir": "/Users/you/path/to/repo-1",
+      "goal": "One sentence: what this task should ultimately achieve.",
+      "done": "Concrete, checkable completion criteria — e.g. 'npm test passes and feature X works end to end'.",
+      "engine": "claude",
+      "model": "claude-opus-4-8"
+    },
+    {
+      "id": "task-2",
+      "dir": "/Users/you/path/to/repo-2",
+      "goal": "...",
+      "done": "...",
+      "engine": "codex"
+    },
+    {
+      "id": "task-3",
+      "dir": "/Users/you/path/to/repo-3",
+      "goal": "... (engine/model omitted -> server defaults)",
+      "done": "..."
+    }
+  ]
+}

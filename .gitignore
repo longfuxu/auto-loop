@@ -1,0 +1,14 @@
+/.env
+/.env.*
+/logs/
+/reports/
+/state.json
+/.auto-loop.lock
+/tasks.json
+/tasks copy.json
+/.claude/
+.DS_Store
+
+# Personal / local-only docs (contain absolute paths & session-specific notes)
+/HANDOFF.md
+/README.loop-research.md

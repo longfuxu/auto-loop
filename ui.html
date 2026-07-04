@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>auto-loop control</title>
+<style>
+  :root{--bg:#0f1115;--card:#171a21;--line:#262b36;--fg:#e6e9ef;--mut:#9aa4b2;--acc:#5b9dff;--ok:#3ecf8e;--warn:#f5a623;--bad:#ff6b6b;--rev:#b48cff}
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+  header{display:flex;align-items:center;gap:12px;padding:14px 20px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:5}
+  header h1{font-size:16px;margin:0;font-weight:650}
+  .pill{font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid var(--line)}
+  .pill.on{color:var(--ok);border-color:var(--ok)}.pill.off{color:var(--mut)}
+  .spacer{flex:1}
+  button{font:inherit;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:7px 12px;cursor:pointer}
+  button:hover{border-color:var(--acc)}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#04101f;font-weight:600}
+  button.danger{color:var(--bad);border-color:#3a2730}
+  .tabs{display:flex;gap:6px;padding:12px 20px 0}
+  .tab{padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;color:var(--mut);border:1px solid transparent;border-bottom:none}
+  .tab.active{color:var(--fg);background:var(--card);border-color:var(--line)}
+  main{padding:16px 20px 60px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:14px}
+  label{display:block;font-size:12px;color:var(--mut);margin:8px 0 3px}
+  input,textarea,select{width:100%;background:#0d0f14;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:8px;font:inherit}
+  textarea{resize:vertical;min-height:52px}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .taskhead{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  .taskhead strong{font-size:15px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--mut);font-weight:500}
+  .st{font-weight:600;text-transform:uppercase;font-size:11px;letter-spacing:.04em}
+  .st.complete{color:var(--ok)}.st.in_progress{color:var(--acc)}.st.pending{color:var(--mut)}
+  .st.blocked,.st.error{color:var(--bad)}.st.review{color:var(--rev)}
+  .muted{color:var(--mut)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#0d0f14;border:1px solid var(--line);border-radius:10px;padding:10px 16px;max-width:80vw;white-space:pre-wrap;display:none}
+  .toast.bad{border-color:var(--bad);color:var(--bad)}.toast.ok{border-color:var(--ok)}
+  .rendered h1{font-size:18px}.rendered h2{font-size:15px;margin-top:18px}.rendered h3{font-size:13px;color:var(--mut)}
+  .rendered pre{background:#0d0f14;border:1px solid var(--line);border-radius:8px;padding:10px;overflow:auto}
+  .rendered table{margin:8px 0}
+  .hint{font-size:12px;color:var(--mut);margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>⟳ auto-loop</h1>
+  <span id="loopPill" class="pill off">loop: —</span>
+  <div class="spacer"></div>
+  <button id="btnStart" class="primary">▶ Start</button>
+  <button id="btnStop" class="danger">■ Stop</button>
+</header>
+<div class="tabs">
+  <div class="tab active" data-tab="tasks">Tasks</div>
+  <div class="tab" data-tab="status">Status</div>
+  <div class="tab" data-tab="reports">Reports</div>
+</div>
+<main>
+  <section id="tab-tasks">
+    <div id="taskList"></div>
+    <button id="btnAdd">+ Add task</button>
+    <button id="btnSave" class="primary">Save &amp; Validate</button>
+    <p class="hint">Saving writes <span class="mono">tasks.json</span> and runs the CLI validator. Fix any hard errors before starting the loop. <span class="mono">model</span>/<span class="mono">engine</span> are optional (engine defaults to the server default; blank model = account default).</p>
+  </section>
+  <section id="tab-status" style="display:none">
+    <div class="card"><table id="statusTable"><thead><tr>
+      <th>Task</th><th>Engine</th><th>Status</th><th>Runs</th><th>Err</th><th>Last</th><th>Summary</th>
+    </tr></thead><tbody></tbody></table></div>
+    <p class="hint">Auto-refreshes every 5s. <b>review</b> = worker claims done, independent auditor is checking. Status is read from <span class="mono">state.json</span>.</p>
+  </section>
+  <section id="tab-reports" style="display:none">
+    <div class="card"><label>Report</label><select id="reportSel"></select></div>
+    <div class="card rendered" id="reportBody"><span class="muted">Select a report.</span></div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script>
+const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+let TASKS=[], STATE={};
+function toast(msg,kind){const t=$("#toast");t.textContent=msg;t.className="toast "+(kind||"");t.style.display="block";clearTimeout(t._t);t._t=setTimeout(()=>t.style.display="none",4200);}
+async function api(path,opts){const r=await fetch(path,opts);const ct=r.headers.get("content-type")||"";return ct.includes("json")?r.json():r.text();}
+
+$$(".tab").forEach(t=>t.onclick=()=>{
+  $$(".tab").forEach(x=>x.classList.remove("active"));t.classList.add("active");
+  ["tasks","status","reports"].forEach(n=>$("#tab-"+n).style.display=n===t.dataset.tab?"":"none");
+  if(t.dataset.tab==="reports")loadReports();
+});
+
+function taskCard(t,i){
+  const d=document.createElement("div");d.className="card";
+  d.innerHTML=`<div class="taskhead"><strong>#${i+1}</strong><input class="f-id" placeholder="task-id (slug)" value="${esc(t.id||"")}" style="max-width:220px">
+    <div class="spacer" style="flex:1"></div><button class="danger f-del">Delete</button></div>
+    <label>Directory (absolute path to a git repo)</label><input class="f-dir" placeholder="/Users/you/path/to/repo" value="${esc(t.dir||"")}">
+    <label>Goal</label><textarea class="f-goal" placeholder="One concrete objective.">${esc(t.goal||"")}</textarea>
+    <label>Done when (checkable criteria — commands/artifacts)</label><textarea class="f-done" placeholder="e.g. npm run build passes; tests green; committed on a branch">${esc(t.done||"")}</textarea>
+    <div class="row2"><div><label>Engine (optional)</label><select class="f-engine">
+      <option value="">default</option><option value="claude">claude</option><option value="codex">codex</option></select></div>
+    <div><label>Model (optional)</label><input class="f-model" placeholder="claude-opus-4-8 / gpt-5-codex / blank=default" value="${esc(t.model||"")}"></div></div>`;
+  d.querySelector(".f-engine").value=t.engine||"";
+  d.querySelector(".f-del").onclick=()=>{TASKS.splice(i,1);renderTasks();};
+  return d;
+}
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function renderTasks(){const c=$("#taskList");c.innerHTML="";TASKS.forEach((t,i)=>c.appendChild(taskCard(t,i)));}
+function collect(){
+  return $$("#taskList .card").map(card=>{
+    const g=s=>card.querySelector(s).value.trim();const o={id:g(".f-id"),dir:g(".f-dir"),goal:g(".f-goal"),done:g(".f-done")};
+    const m=g(".f-model"),e=card.querySelector(".f-engine").value;if(m)o.model=m;if(e)o.engine=e;return o;
+  });
+}
+$("#btnAdd").onclick=()=>{TASKS.push({id:"",dir:"",goal:"",done:""});renderTasks();};
+$("#btnSave").onclick=async()=>{
+  const tasks=collect();if(!tasks.length){toast("Add at least one task","bad");return;}
+  const r=await api("/api/tasks",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({tasks})});
+  toast((r.ok?"✓ Saved & validated\n":"✗ Saved but validation failed:\n")+(r.output||""),r.ok?"ok":"bad");
+  refresh();
+};
+$("#btnStart").onclick=async()=>{const r=await api("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"start"})});toast(r.error?("✗ "+r.error):"▶ loop started",r.error?"bad":"ok");setTimeout(refresh,800);};
+$("#btnStop").onclick=async()=>{const r=await api("/api/control",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"stop"})});toast("■ "+(r.output||"stopped"),"ok");setTimeout(refresh,600);};
+
+function renderStatus(){
+  const tb=$("#statusTable tbody");tb.innerHTML="";
+  TASKS.forEach(t=>{
+    const s=STATE[t.id]||{};const tr=document.createElement("tr");
+    tr.innerHTML=`<td class="mono">${esc(t.id)}</td><td>${esc(t.engine||"default")}</td>
+      <td><span class="st ${esc(s.status||"pending")}">${esc(s.status||"pending")}</span></td>
+      <td>${s.runs??0}</td><td>${s.errors??0}</td><td class="muted">${esc(s.last||"–")}</td>
+      <td>${esc(s.summary||"–")}</td>`;
+    tb.appendChild(tr);
+  });
+}
+async function refresh(){
+  const d=await api("/api/summary");TASKS=d.tasks||[];STATE=d.state||{};
+  $("#loopPill").textContent="loop: "+(d.running?("running · pid "+d.pid):"stopped");
+  $("#loopPill").className="pill "+(d.running?"on":"off");
+  if($(".tab.active").dataset.tab==="tasks" && !$("#taskList").dataset.dirty)renderTasks();
+  renderStatus();
+  window._reports=d.reports||[];
+}
+function loadReports(){
+  const sel=$("#reportSel");sel.innerHTML="";
+  (window._reports||[]).forEach(n=>{const o=document.createElement("option");o.value=n;o.textContent=n;sel.appendChild(o);});
+  sel.onchange=async()=>{const md=await api("/api/report?name="+encodeURIComponent(sel.value));$("#reportBody").innerHTML=mdToHtml(md);};
+  if(sel.value)sel.onchange();else $("#reportBody").innerHTML='<span class="muted">No reports yet — they appear after a run, a rate-limit window, or ./auto-loop.sh report.</span>';
+}
+function mdToHtml(md){
+  const lines=String(md).split("\n");let html="",inCode=false,tbl=[];
+  const flush=()=>{if(tbl.length){html+="<table>"+tbl.map((r,i)=>{if(/^\|[-\s|]+\|?$/.test(r))return"";const cells=r.split("|").slice(1,-1).map(c=>c.trim());const tag=i===0?"th":"td";return"<tr>"+cells.map(c=>`<${tag}>${esc(c)}</${tag}>`).join("")+"</tr>";}).join("")+"</table>";tbl=[];}};
+  for(const ln of lines){
+    if(ln.startsWith("```")){flush();inCode=!inCode;html+=inCode?"<pre>":"</pre>";continue;}
+    if(inCode){html+=esc(ln)+"\n";continue;}
+    if(ln.startsWith("|")){tbl.push(ln);continue;}flush();
+    if(ln.startsWith("### "))html+="<h3>"+esc(ln.slice(4))+"</h3>";
+    else if(ln.startsWith("## "))html+="<h2>"+esc(ln.slice(3))+"</h2>";
+    else if(ln.startsWith("# "))html+="<h1>"+esc(ln.slice(2))+"</h1>";
+    else if(ln.trim()==="")html+="";
+    else html+="<p>"+esc(ln).replace(/`([^`]+)`/g,'<span class="mono">$1</span>')+"</p>";
+  }
+  flush();return html;
+}
+$("#taskList").addEventListener("input",()=>$("#taskList").dataset.dirty="1");
+refresh();setInterval(()=>{if(!$("#taskList").dataset.dirty||$(".tab.active").dataset.tab!=="tasks")refresh();},5000);
+</script>
+</body>
+</html>
