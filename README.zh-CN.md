@@ -30,7 +30,36 @@
 
 ## task 写法
 
-`tasks.json` 只有一个顶层字段：
+推荐只编辑 `tasks.md`，不要手写 `tasks.json`。`tasks.json` 是机器生成的规范文件，runner 仍然读取它；这样可以避免 JSON 里最容易出错的原始换行、引号转义、尾逗号。
+
+第一次使用：
+
+```bash
+cp tasks.md.example tasks.md
+$EDITOR tasks.md
+./auto-loop.sh prepare
+./auto-loop.sh validate
+```
+
+`tasks.md` 写法：
+
+```md
+## stable-short-id
+
+dir: /absolute/path/to/repo
+engine: claude
+
+goal:
+这里可以写多行自然语言，不需要转义引号或换行。
+
+done:
+写清楚可验证条件，例如 `npm test` passes，或者
+`test -s STRATEGY.md`。
+```
+
+`./auto-loop.sh prepare` 会把 Markdown 编译成 `tasks.json`。它先做确定性解析，再在可用时调用 LLM 优化 task 描述，把 `done` 改得更可审计。最终生成的 JSON 仍然会走本地 validator。
+
+兼容的 `tasks.json` 顶层字段仍然是：
 
 ```json
 {
@@ -59,10 +88,17 @@
 ```bash
 cd /path/to/auto-loop
 
+# 从 tasks.md 生成 tasks.json（可用时会调用 LLM 做 doctor/优化）
+./auto-loop.sh prepare
+
+# 预览 prepare 结果，但不写入 tasks.json
+./auto-loop.sh doctor
+
 # 校验 tasks.json（不启动任何任务；检查 id/dir/goal/done、是否 git repo、done 是否可验证）
+# 如果 tasks.md 比 tasks.json 新，validate 会先自动 prepare
 ./auto-loop.sh validate
 
-# 用 $EDITOR 编辑 tasks.json，退出后自动重新校验
+# 用 $EDITOR 编辑 tasks.md（若存在），退出后自动 prepare + 校验
 ./auto-loop.sh edit
 
 # 查看当前状态（含 loop 是否在运行）

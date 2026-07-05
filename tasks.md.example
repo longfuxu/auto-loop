@@ -1,0 +1,39 @@
+# Human task list
+
+Edit `tasks.md`, then run:
+
+```bash
+./auto-loop.sh prepare
+./auto-loop.sh validate
+```
+
+`prepare` converts this Markdown into `tasks.json`. It first parses the file
+deterministically, then asks the configured LLM to clean up the task wording and
+make `done` criteria more auditable. The final JSON is still validated before a
+loop can start.
+
+## my-feature
+
+dir: /absolute/path/to/a/git/repo
+engine: claude
+model:
+
+goal:
+Build one concrete feature or deliver one concrete artifact. You can write
+multiple paragraphs here without escaping quotes or newlines.
+
+done:
+Name exact artifacts and checks. For example: create and commit
+`FEATURE_PLAN.md`; verify with `test -s FEATURE_PLAN.md`; run `npm test`.
+
+## review-the-roadmap
+
+dir: /absolute/path/to/another/git/repo
+
+goal:
+Review the current roadmap and source tree. Identify the highest-leverage next
+implementation step and write the recommendation into a repo document.
+
+done:
+Create and commit `ROADMAP_REVIEW.md`; include concrete risks, next actions, and
+verification commands; run the repo's available test command.

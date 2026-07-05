@@ -85,14 +85,36 @@ Requirements: `bash`, `jq`, `git`, `python3` (for the UI), and at least one agen
 
 ```bash
 git clone <your-fork-url> auto-loop && cd auto-loop
-cp tasks.example.json tasks.json
-$EDITOR tasks.json          # or: ./auto-loop.sh ui
+cp tasks.md.example tasks.md
+$EDITOR tasks.md            # human-friendly; multiline text is fine
+./auto-loop.sh prepare      # writes canonical tasks.json
 ./auto-loop.sh validate     # check your tasks before running
 ```
 
 ## Task format
 
-`tasks.json`:
+Prefer editing `tasks.md`; `tasks.json` is the generated canonical file used by
+the runner. This avoids JSON escaping mistakes such as raw newlines inside
+strings or trailing commas.
+
+`tasks.md`:
+
+```md
+## my-feature
+
+dir: /absolute/path/to/a/git/repo
+engine: claude
+
+goal:
+One concrete objective. This can be multiple paragraphs and does not need JSON
+escaping.
+
+done:
+Concrete, auditable completion criteria. Name files and commands, e.g.
+`npm test` passes and `FEATURE_PLAN.md` exists.
+```
+
+Run `./auto-loop.sh prepare` to compile that Markdown into:
 
 ```json
 {
@@ -109,6 +131,12 @@ $EDITOR tasks.json          # or: ./auto-loop.sh ui
 }
 ```
 
+`prepare` first parses the Markdown deterministically, then asks the configured
+LLM to clean up task wording and make `done` criteria more objective. The output
+is still validated locally before the loop can start. Set `TASK_PREPARE_LLM=off`
+for deterministic-only generation, or `TASK_PREPARE_LLM=required` if missing LLM
+optimization should be a hard failure.
+
 - `id` — slug, `^[a-z0-9-]+$`, unique.
 - `dir` — absolute path to a **git repo** (the worker commits its work).
 - `goal` / `done` — the more concrete and *verifiable* `done` is, the better the auditor works. Name the exact commands.
@@ -121,9 +149,11 @@ Put credentials in the **environment** (e.g. `VERCEL_TOKEN`), never in `tasks.js
 
 ```bash
 ./auto-loop.sh              # run the loop (foreground)
+./auto-loop.sh prepare      # compile tasks.md -> tasks.json, with LLM cleanup when available
+./auto-loop.sh doctor       # preview prepared JSON without writing tasks.json
 ./auto-loop.sh status       # per-task status table + whether the loop is running
-./auto-loop.sh validate     # lint tasks.json (id/dir/git/engine/done) — non-zero exit on hard errors
-./auto-loop.sh edit         # $EDITOR tasks.json, then re-validate
+./auto-loop.sh validate     # prepare if needed, then lint tasks.json — non-zero exit on hard errors
+./auto-loop.sh edit         # $EDITOR tasks.md if present, else tasks.json, then re-validate
 ./auto-loop.sh sessions     # task -> engine -> session_id -> dir
 ./auto-loop.sh attach <id>  # interactive TUI on a task's stored session
 ./auto-loop.sh report       # write a status report now (reports/report-<ts>.md)
@@ -165,10 +195,13 @@ This tool runs agents **unattended with approvals skipped** (`--dangerously-skip
 
 ```
 auto-loop.sh        # the harness: engines, rate-limit sleep, auditor, subcommands
+scripts/prepare_tasks.py  # tasks.md -> tasks.json compiler with optional LLM cleanup
 ui-server.py        # local web UI backend (Python stdlib only; calls auto-loop.sh)
 ui.html             # single-file UI (Tasks / Status / Reports)
+tasks.md.example    # human-friendly task template
+tasks.md            # your human-edited task list (you create this; git-ignored)
 tasks.example.json  # copy to tasks.json
-tasks.json          # your task list (you create this)
+tasks.json          # canonical generated task list (git-ignored)
 state.json          # runtime state (git-ignored, auto-created)
 logs/               # main.log + per-run/audit JSON transcripts (git-ignored)
 reports/            # markdown window reports (git-ignored)

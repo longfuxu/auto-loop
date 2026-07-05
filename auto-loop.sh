@@ -20,9 +20,11 @@
 #
 # Usage:
 #   ./auto-loop.sh [run]           # run the loop in the foreground
+#   ./auto-loop.sh prepare         # compile tasks.md -> tasks.json and validate it
+#   ./auto-loop.sh doctor          # preview prepared tasks.json without writing it
 #   ./auto-loop.sh status          # print each task's state and exit
 #   ./auto-loop.sh validate        # lint tasks.json without running anything
-#   ./auto-loop.sh edit            # open tasks.json in $EDITOR, then re-validate
+#   ./auto-loop.sh edit            # open tasks.md if present, else tasks.json, then re-validate
 #   ./auto-loop.sh sessions        # list task -> engine -> session_id -> dir
 #   ./auto-loop.sh attach <id>     # open the INTERACTIVE agent TUI on a task's session
 #   ./auto-loop.sh report          # (re)generate a status report on demand
@@ -34,16 +36,18 @@
 # Logs: logs/. Reports: reports/. Lock: .auto-loop.lock.
 # Env overrides: ENGINE, MODEL, PERM_FLAGS, IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS,
 #   CLAUDE_BIN, CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT, AUDIT, AUDIT_MODEL,
-#   AUDIT_ENGINE, UI_PORT, EDITOR.
+#   AUDIT_ENGINE, UI_PORT, EDITOR, TASKS_MD, TASK_PREPARE_LLM, PREPARE_MODEL.
 
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TASKS="${TASKS_FILE:-$ROOT/tasks.json}"
+TASKS_MD="${TASKS_MD:-$ROOT/tasks.md}"
 STATE="${STATE_FILE:-$ROOT/state.json}"
 LOGDIR="$ROOT/logs"
 REPORTDIR="$ROOT/reports"
 LOCKFILE="$ROOT/.auto-loop.lock"
+PREPARE_SCRIPT="$ROOT/scripts/prepare_tasks.py"
 mkdir -p "$LOGDIR" "$REPORTDIR"
 
 ENGINE="${ENGINE:-claude}"             # default agent engine: claude | codex
@@ -66,16 +70,31 @@ log(){ printf '%s | %s\n' "$(ts)" "$*" | tee -a "$LOGDIR/main.log" >&2; }
 die(){ log "FATAL: $*"; exit 1; }
 
 command -v jq >/dev/null || die "jq not found on PATH"
-[ -f "$TASKS" ] || die "missing $TASKS — copy tasks.example.json to tasks.json and fill it in"
+[ -f "$TASKS" ] || [ -f "$TASKS_MD" ] || die "missing $TASKS — copy tasks.md.example to tasks.md and run ./auto-loop.sh prepare (or copy tasks.example.json to tasks.json)"
 
 engine_bin(){ case "$1" in claude) echo "$CLAUDE_BIN";; codex) echo "$CODEX_BIN";; *) echo "";; esac; }
 require_engine(){ local b; b="$(engine_bin "$1")"; [ -n "$b" ] || die "unknown engine: '$1' (use claude|codex)"; command -v "$b" >/dev/null || die "$1 CLI not found ($b)"; }
+require_prepare_tool(){ command -v python3 >/dev/null || die "python3 not found (needed for tasks.md prepare)"; [ -f "$PREPARE_SCRIPT" ] || die "missing $PREPARE_SCRIPT"; }
+
+run_prepare(){
+  require_prepare_tool
+  python3 "$PREPARE_SCRIPT" --root "$ROOT" --markdown "$TASKS_MD" --json "$TASKS" "$@"
+}
+
+maybe_prepare_tasks(){
+  [ -f "$TASKS_MD" ] || return 0
+  if [ ! -f "$TASKS" ] || [ "$TASKS_MD" -nt "$TASKS" ] || ! jq -e . "$TASKS" >/dev/null 2>&1; then
+    log "prepare: compiling $TASKS_MD -> $TASKS"
+    run_prepare || die "prepare failed"
+  fi
+}
 
 # --- state.json helpers ------------------------------------------------------
 state_write(){ local tmp; tmp="$(mktemp)"; cat > "$tmp" && mv "$tmp" "$STATE"; }
 
 init_state(){
   [ -f "$STATE" ] || echo '{}' > "$STATE"
+  [ -f "$TASKS" ] || die "missing $TASKS — run ./auto-loop.sh prepare to generate it from $TASKS_MD"
   local count id
   count="$(jq -r '.tasks | length' "$TASKS")" || die "tasks.json: cannot read .tasks"
   [ "$count" -gt 0 ] || die "tasks.json has no tasks"
@@ -354,8 +373,16 @@ cmd_status(){
   loop_running && printf '\nloop: RUNNING (PID %s)\n\n' "$(loop_pid)" || printf '\nloop: not running\n\n'
 }
 
-cmd_validate(){ if validate_tasks; then log "validate: OK"; echo "tasks.json OK"; else die "validate: tasks.json has hard errors (see above)"; fi; }
-cmd_edit(){ local ed="${EDITOR:-vi}"; "$ed" "$TASKS" || die "editor exited nonzero"; jq -e . "$TASKS" >/dev/null 2>&1 || die "tasks.json is no longer valid JSON"; cmd_validate; }
+cmd_prepare(){ [ -f "$TASKS_MD" ] || die "missing $TASKS_MD (copy tasks.md.example or create it)"; run_prepare || die "prepare failed"; if validate_tasks; then log "validate: OK"; echo "tasks.json OK"; else die "validate: tasks.json has hard errors (see above)"; fi; }
+cmd_doctor(){ [ -f "$TASKS_MD" ] || die "missing $TASKS_MD (copy tasks.md.example or create it)"; run_prepare --dry-run; }
+cmd_validate(){ maybe_prepare_tasks; if validate_tasks; then log "validate: OK"; echo "tasks.json OK"; else die "validate: tasks.json has hard errors (see above)"; fi; }
+cmd_edit(){
+  local ed="${EDITOR:-vi}" target="$TASKS"
+  [ -f "$TASKS_MD" ] && target="$TASKS_MD"
+  "$ed" "$target" || die "editor exited nonzero"
+  if [ "$target" = "$TASKS_MD" ]; then cmd_prepare
+  else jq -e . "$TASKS" >/dev/null 2>&1 || die "tasks.json is no longer valid JSON"; cmd_validate; fi
+}
 
 cmd_sessions(){
   init_state
@@ -396,6 +423,7 @@ cmd_report(){ init_state; write_report manual; }
 cmd_ui(){ local port="${1:-$UI_PORT}"; command -v python3 >/dev/null || die "python3 not found (needed for the web UI)"; log "UI on http://127.0.0.1:$port (Ctrl-C to stop)"; exec python3 "$ROOT/ui-server.py" "$port"; }
 
 main(){
+  maybe_prepare_tasks
   init_state
   validate_tasks || die "tasks.json has hard errors — fix them or run ./auto-loop.sh validate (set REQUIRE_GIT=0 to allow non-git dirs)"
   acquire_lock
@@ -416,6 +444,8 @@ main(){
 
 case "${1:-run}" in
   run)      main;;
+  prepare)  cmd_prepare;;
+  doctor)   cmd_doctor;;
   status)   cmd_status;;
   validate) cmd_validate;;
   edit)     cmd_edit;;
@@ -424,5 +454,5 @@ case "${1:-run}" in
   report)   cmd_report;;
   ui)       shift; cmd_ui "${1:-}";;
   stop)     cmd_stop;;
-  *)        die "unknown arg: '$1' (use: run | status | validate | edit | sessions | attach <id> | report | ui | stop)";;
+  *)        die "unknown arg: '$1' (use: run | prepare | doctor | status | validate | edit | sessions | attach <id> | report | ui | stop)";;
 esac

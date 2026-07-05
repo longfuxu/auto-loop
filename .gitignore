@@ -5,9 +5,11 @@
 /state.json
 /.auto-loop.lock
 /tasks.json
+/tasks.md
 /tasks copy.json
 /.claude/
 .DS_Store
+__pycache__/
 
 # Personal / local-only docs (contain absolute paths & session-specific notes)
 /HANDOFF.md
