@@ -308,6 +308,11 @@ def main() -> int:
     try:
         tasks = validate_payload(payload)
         if used_llm:
+            if len(tasks) != len(draft_tasks):
+                raise ValueError(
+                    f"LLM changed task count ({len(draft_tasks)} -> {len(tasks)}); "
+                    "refusing to trust LLM-supplied ids/dirs"
+                )
             tasks = validate_payload({"tasks": guard_llm_tasks(tasks, draft_tasks)})
     except Exception as exc:
         if used_llm and draft_tasks:
