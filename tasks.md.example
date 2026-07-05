@@ -15,8 +15,24 @@ loop can start.
 ## my-feature
 
 dir: /absolute/path/to/a/git/repo
+
+<!--
+Engine options:
+- engine: claude
+- engine: codex
+
+Model examples, passed through to the selected CLI:
+- Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
+- Codex: gpt-5-codex, gpt-5
+
+Leave engine/model blank to use the global default/account default.
+Add fallback_engine/fallback_model when you want the task to continue with the
+other engine after the active one hits a usage limit.
+-->
 engine: claude
 model:
+fallback_engine: codex
+fallback_model:
 
 goal:
 Build one concrete feature or deliver one concrete artifact. You can write

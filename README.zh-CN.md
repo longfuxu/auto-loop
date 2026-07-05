@@ -2,195 +2,227 @@
 
 [English](README.md) · **简体中文**
 
-> 完整的英文说明（含设计动机、安全、公开发布）见 [`README.md`](README.md)。这里是快速中文向导。
+`auto-loop` 是一个本地任务队列：用 Markdown 写 backlog，让 Claude Code 或 OpenAI Codex CLI 一个 task 一个 task 地跑；撞到 usage limit 时可以睡到窗口恢复，也可以切到另一个 engine 继续；每个 task/engine 单独保存 session；worker 说完成以后，还要由独立 auditor 验证才算完成。
 
-这个目录提供一个很小的 bash 自动循环：按 `tasks.json` 中的顺序，把任务交给 agent CLI（**Claude Code 或 OpenAI Codex**）以非交互模式执行；撞到额度限制就睡到窗口恢复后继续同一个 task session。
+它不是大型 agent 平台，而是一个小而可读的本地 harness：一个 Bash runner、一个标准库 Python UI、一个 `tasks.md -> tasks.json` 编译器。适合仍然想保留本地 Claude Code / Codex CLI 控制权的人。
 
-**本轮新增的三件事：**
+## 核心卖点
 
-- **多引擎**：每个 task 可写 `"engine": "claude"` 或 `"codex"`（不写就用默认）。Claude 读 `resetsAt` 精确睡到窗口恢复；Codex 没有精确 reset，用 `CODEX_COOLDOWN`（默认 1 小时）退避。
-- **独立审计**：worker 说 `TASK_COMPLETE` 后不直接算完成，而是转入 `review`，由**另一个全新的审计 agent**（不共享 session）去跑 `done` 里写的验证命令、看 diff，只有 `AUDIT_PASS` 才标记 complete；失败则打回 `in_progress` 让下轮修。用 `AUDIT=0` 关闭。
-- **摘要恢复 / token management**：默认仍用 Claude Code 的正常 `--resume <session_id>`。如果设置 `CLAUDE_RESUME_MODE=summary`，某个 Claude task 撞到 usage limit 后，下一次恢复会用 `summaries/<task>.md` 里的本地任务摘要开启一个 fresh session，而不是继续塞入完整历史 transcript。这样适合长任务跨多个额度窗口时控制上下文体积。
-- **Web UI（给非程序员）**：`./auto-loop.sh ui` 起一个只绑 `127.0.0.1` 的本地网页，用来加载/编辑任务、看状态、看报告、启停 loop。核心仍然是 CLI。
+- **Markdown 任务入口**：写 `tasks.md`，不用手写 JSON。
+- **双引擎**：每个 task 可选 `claude` 或 `codex`。
+- **模型可配置**：每个 task 可写 `model:`，不填就用全局默认或账号默认。
+- **额度限制后切换引擎**：`fallback_engine: codex` 可以让 Claude hit limit 后由 Codex 接着做，反过来也可以。
+- **per-task / per-engine session**：`state.json` 里分别保存 `sessions.claude` 和 `sessions.codex`，不会把一个 engine 的 resume id 误传给另一个。
+- **摘要恢复**：长任务可用 `CLAUDE_RESUME_MODE=summary`，用本地 summary 控制上下文体积。
+- **独立审计**：worker 输出 `TASK_COMPLETE` 后只是进 `review`，必须另一个 auditor 跑验证命令后给 `AUDIT_PASS` 才 complete。
+- **本地 UI**：`./auto-loop.sh ui` 起只绑定 `127.0.0.1` 的小网页，可编辑任务、看状态、看报告、启停 loop。
 
-## 什么时候适合用
+## 快速开始
 
-适合：
+依赖：`bash`、`jq`、`git`、`python3`，以及至少一个已登录的 CLI：
 
-- 任务目标已经明确，且能拆成一次次可提交的代码增量。
-- 每个 task 的 `dir` 是一个真实 git repo 或 worktree。
-- 完成条件能用命令或文件状态验证。
-- 可以接受 Claude 在无人值守状态下创建 feature branch、修改代码、运行测试、commit。
-
-不适合：
-
-- 需要临场判断、发消息、做公开发布决策的任务。
-- `dir` 不是 git repo 的任务，因为 worker prompt 要求 commit。
-- 需要人工输入验证码、OAuth 登录、2FA 或未配置的 token。
-- 把 API token、Vercel token、SSH key 等秘密直接写进 `tasks.json` 的任务。
-
-## task 写法
-
-推荐只编辑 `tasks.md`，不要手写 `tasks.json`。`tasks.json` 是机器生成的规范文件，runner 仍然读取它；这样可以避免 JSON 里最容易出错的原始换行、引号转义、尾逗号。
-
-第一次使用：
+- `claude`
+- `codex`
 
 ```bash
+git clone <your-fork-url> auto-loop
+cd auto-loop
 cp tasks.md.example tasks.md
 $EDITOR tasks.md
+TASK_PREPARE_LLM=off ./auto-loop.sh prepare
+./auto-loop.sh validate
+./auto-loop.sh run
+```
+
+## tasks.md 写法
+
+推荐只编辑 `tasks.md`。`tasks.json` 是生成文件，runner 读取它。
+
+```md
+## build-settings-panel
+
+dir: /absolute/path/to/a/git/repo
+
+<!--
+Engine options:
+- engine: claude
+- engine: codex
+
+Model examples, passed through to the selected CLI:
+- Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
+- Codex: gpt-5-codex, gpt-5
+
+Leave engine/model blank to use the global default/account default.
+Use fallback_engine/fallback_model when you want continuation after a usage limit.
+-->
+engine: claude
+model:
+fallback_engine: codex
+fallback_model:
+
+goal:
+实现 docs/settings-plan.md 里描述的 settings panel。
+
+done:
+在 feature branch 上创建并提交实现。`npm test` 和 `npm run build` 通过。
+更新 HANDOFF.md，写清楚改了哪些文件和下次第一条命令。
+```
+
+字段说明：
+
+- `id`：默认来自 `##` 标题，也可以显式写 `id:`；必须匹配 `^[a-z0-9-]+$`。
+- `dir`：绝对路径，指向一个 git repo 或 worktree。
+- `goal`：任务目标。
+- `done`：可验证完成标准，最好写具体命令和文件。
+- `engine`：可选，`claude` 或 `codex`；不填用 `$ENGINE`，再不填默认 `claude`。
+- `model`：可选，传给 primary engine；不填用 `$MODEL`，再不填用账号默认。
+- `fallback_engine`：可选，active engine hit limit 后切换到这里。
+- `fallback_model`：可选，传给 fallback engine；不填用 `$MODEL`，再不填用账号默认。
+
+编译和校验：
+
+```bash
 ./auto-loop.sh prepare
 ./auto-loop.sh validate
 ```
 
-`tasks.md` 写法：
+`prepare` 先用确定性 parser 解析 Markdown。如果启用优化 pass，它只允许润色 `goal` / `done`；task 数量、id、dir、engine、model 仍以确定性 parser 为准。想完全关闭优化：
+
+```bash
+TASK_PREPARE_LLM=off ./auto-loop.sh prepare
+```
+
+## 引擎切换
+
+当 task 撞到 usage limit：
+
+- Claude：能读到 `resetsAt` 时精确记录 reset 时间。
+- Codex：没有精确 reset epoch，所以用 `CODEX_COOLDOWN`。
+- 如果配置了可用的 `fallback_engine`，不会立刻睡觉，而是切到 fallback engine 继续。
+- fallback run 会看到本地 task summary，并被要求先检查 repo state 再继续。
+
+示例：
 
 ```md
-## stable-short-id
-
-dir: /absolute/path/to/repo
 engine: claude
-
-goal:
-这里可以写多行自然语言，不需要转义引号或换行。
-
-done:
-写清楚可验证条件，例如 `npm test` passes，或者
-`test -s STRATEGY.md`。
+model: claude-opus-4-8
+fallback_engine: codex
+fallback_model: gpt-5-codex
 ```
 
-`./auto-loop.sh prepare` 会把 Markdown 编译成 `tasks.json`。它先做确定性解析，再在可用时调用 LLM 优化 task 描述，把 `done` 改得更可审计。最终生成的 JSON 仍然会走本地 validator。
+含义：优先用 Claude 和指定模型；Claude hit limit 后，Codex 接着做。
 
-兼容的 `tasks.json` 顶层字段仍然是：
+## 摘要恢复 / token management
 
-```json
-{
-  "tasks": [
-    {
-      "id": "stable-short-id",
-      "dir": "/absolute/path/to/repo",
-      "goal": "One concrete objective.",
-      "done": "Concrete completion criteria with commands and expected artifacts."
-    }
-  ]
-}
+```bash
+CLAUDE_RESUME_MODE=summary ./auto-loop.sh run
 ```
 
-建议：
+模式：
 
-- `id` 用短 slug，例如 `add-user-auth`（必须匹配 `^[a-z0-9-]+$`）。
-- `dir` 必须是绝对路径，且是一个 git repo（worker 要 commit）。
-- `goal` 说明最终要完成什么。
-- `done` 写可验证条件，例如 `npm run build passes`、`uv run pytest tests/test_x.py -q passes`、`HANDOFF.md updated`。
-- `model`（可选）：给这个 task 指定模型，例如 `claude-opus-4-8` / `claude-sonnet-5`。不写就用全局 `MODEL` 环境变量，再没有就用账号默认模型。
-- credential 用环境变量，例如 `VERCEL_TOKEN`，不要写入 JSON、日志或 handoff。
+- `full`：默认，继续使用保存的 session id。
+- `summary`：正常 resume；Claude hit limit 后，下一次 Claude run 用 `summaries/<task>.md` 开 fresh session。
+- `fresh`：只要有 summary，就直接用 summary 开 fresh session。
+
+summary 包含 goal、done、最后一次结果、active engine、各 engine session id、最近 commit 等轻量上下文。
+
+## 独立审计
+
+worker 输出：
+
+```text
+TASK_COMPLETE
+```
+
+并不会直接 complete。task 会进入 `review`，由另一个独立 auditor 检查：
+
+- git 状态、最近提交和 diff；
+- `done` 里写的验证命令；
+- 实际文件/产物是否存在。
+
+auditor 只能输出：
+
+- `AUDIT_PASS`
+- `AUDIT_FAIL: <reason>`
+
+只有 `AUDIT_PASS` 会把 task 标记为 complete。`AUDIT=0` 可以关闭，但这意味着接受 worker 自证完成。
 
 ## 常用命令
 
 ```bash
-cd /path/to/auto-loop
-
-# 从 tasks.md 生成 tasks.json（可用时会调用 LLM 做 doctor/优化）
-./auto-loop.sh prepare
-
-# 预览 prepare 结果，但不写入 tasks.json
-./auto-loop.sh doctor
-
-# 校验 tasks.json（不启动任何任务；检查 id/dir/goal/done、是否 git repo、done 是否可验证）
-# 如果 tasks.md 比 tasks.json 新，validate 会先自动 prepare
-./auto-loop.sh validate
-
-# 用 $EDITOR 编辑 tasks.md（若存在），退出后自动 prepare + 校验
-./auto-loop.sh edit
-
-# 查看当前状态（含 loop 是否在运行）
-./auto-loop.sh status
-
-# 列出每个 task 的 session_id / dir（用于交互接管）
-./auto-loop.sh sessions
-
-# 交互式接管某个 task：打开正常的 Claude Code TUI，续上无人值守时的那个 session
-./auto-loop.sh attach <task-id>
-
-# 生成一份状态报告（也会在每个 5 小时窗口结束、loop 停止时自动生成）
-./auto-loop.sh report        # 输出写到 reports/report-<ts>.md
-
-# 前台运行
-./auto-loop.sh run
-
-# 后台无人值守运行
-nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &
-
-# Claude token-management 模式：rate limit 后用摘要开启 fresh session
-CLAUDE_RESUME_MODE=summary ./auto-loop.sh
-
-# 看主日志
-tail -f logs/main.log
-
-# 停止 loop（优先用 stop，它读锁文件里的 PID）
-./auto-loop.sh stop
+./auto-loop.sh run          # 前台运行
+./auto-loop.sh prepare      # tasks.md -> tasks.json
+./auto-loop.sh doctor       # 预览生成的 JSON，不写文件
+./auto-loop.sh validate     # 校验任务；必要时先 prepare
+./auto-loop.sh edit         # 编辑 tasks.md 或 tasks.json，然后校验
+./auto-loop.sh status       # 看 task 状态、engine spec、active engine
+./auto-loop.sh sessions     # 看每个 task 的 per-engine sessions
+./auto-loop.sh attach <id>  # 交互式接管 active engine 的 session
+./auto-loop.sh report       # 生成 reports/report-<ts>.md
+./auto-loop.sh ui 8787      # 本地网页 UI
+./auto-loop.sh stop         # 停止 lock file 里的 PID
 ```
 
-## 交互接管（不是 headless）
-
-loop 用 `claude -p ... --resume <session_id>` 无人值守地推进每个 task，并把 `session_id` 记在 `state.json` 里。你随时可以跳进同一个会话手动接管：
+常用环境变量：
 
 ```bash
-./auto-loop.sh stop            # 先停 loop，避免和它抢同一个 session
-./auto-loop.sh attach <task>   # 打开交互式 Claude Code TUI，续上刚才停下的地方
-# …人工检查 / 对话 / 纠偏，然后退出 TUI…
-nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &   # 让 loop 继续
+ENGINE=claude
+MODEL=
+CLAUDE_RESUME_MODE=summary
+CODEX_COOLDOWN=3600
+AUDIT=1
+AUDIT_ENGINE=
+AUDIT_MODEL=
+REQUIRE_GIT=1
 ```
 
-`attach` 打开的就是你现在用的那种交互式 CLI；它续的是 loop 用的同一个 session，所以“从上次离开的地方接着聊”。注意：loop 在跑时不要同时 attach 同一个 task，否则会把会话分叉——`attach` 会检测到锁并要求你确认。
+## 和其它工具的差异
 
-## 摘要恢复 / token management
+你的定位不应该是“最大的 loop”，而是“本地、轻量、双引擎、可审计的 task queue”。
 
-Claude Code 的交互式 `/resume` 在 stale / large session 场景会提示是否先 summarize，当前非交互 CLI 暴露的是 `--resume`，没有文档化的 `--summary` flag。auto-loop 因此在 harness 层实现了可控的摘要恢复：
+| 类型 | 代表 | 他们怎么做 | 你的差异 |
+|---|---|---|---|
+| 任务队列 / rate limit loop | `claude-queue` | Python worker、任务优先级/依赖、监控 Claude plan limit、接近额度时暂停 | 它更像 queue；你的核心卖点是 Claude+Codex 双引擎、per-task session、独立 auditor |
+| 连续循环工具 | `Ralph` | 不断调用 coding agent，靠 exit signal、circuit breaker、resume、日志避免无限循环 | Ralph 很强；你不要硬拼“loop”，要打“task list + quota sleep/fallback + audit” |
+| PR/CI 型自动开发 | Continuous Claude 类工具 | Bash loop、共享 markdown notes、自动建 PR、等 CI、合并 | 它偏 PR workflow；你更轻、更本地、更适合个人 backlog |
+| 图形化 agent 指挥台 | CloudCLI、Codexia、async-code | Web/mobile/desktop UI、session 管理、parallel tasks、worktree、远程控制 | 它们更大更重；你应强调“小、可读、几百行 Bash + 本地 UI” |
+| 官方异步 agent | Claude Code on web、Claude routines、OpenAI Codex | 云端 sandbox、GitHub repo、自动 PR、并行任务 | 官方产品强，但不等于本地 CLI queue；你是给仍然想控制本地 Claude Code / Codex CLI 的人 |
+| 安全/guardrail | CC Safety Net | hook 拦截危险命令 | 可互补；你也要承认 prompt-level guardrail 不是 sandbox |
 
-- `CLAUDE_RESUME_MODE=full`（默认）：保持旧行为，Claude task 用 `--resume <session_id>` 继续同一个 session。
-- `CLAUDE_RESUME_MODE=summary`：正常情况下仍用 `--resume`；一旦某个 Claude task 撞到 usage limit，loop 会把该 task 标记为“下次摘要恢复”。额度恢复后，它会用 `summaries/<task>.md` 里的本地任务摘要开启 fresh session。
-- `CLAUDE_RESUME_MODE=fresh`：只要已有 summary，就始终用 summary + fresh session，而不是 `--resume`。
+## 安全边界
 
-每个成功的 worker run 后，auto-loop 会更新 `summaries/<task>.md`，里面包含 task 目标、done 条件、最后一次 worker 结果、最近 commit 等轻量上下文。`summaries/` 已加入 `.gitignore`。
+默认会跳过 CLI approval：
 
-## 报告
+- Claude: `--dangerously-skip-permissions`
+- Codex: `--dangerously-bypass-approvals-and-sandbox`
 
-- 每个 5 小时额度窗口结束（loop 进入 sleep 前）、loop 全部跑完、或手动 `./auto-loop.sh report` 时，会在 `reports/` 下写一份 markdown 报告。
-- 内容是确定性摘要（不额外消耗 Claude 额度）：每个 task 的 status/runs/errors/最后 sentinel，以及各 task repo 最近 5 条 commit。
+这对无人值守是必要的，但也意味着你在授予本地命令执行能力。只用于你愿意让工具修改的 repo。
 
-## 状态文件
+防线：
 
-`state.json` 是运行时文件。每个 task 会记录：
+- worker prompt 要求只编辑 task 的 `dir`。
+- 要求在 feature branch 上提交。
+- 禁止碰 `main` / `master`、merge、force-push、打印 secret。
+- 启动前校验 task schema、绝对路径、git repo。
+- PID lock 防止两个 loop 抢同一个队列。
+- secret 放环境变量，不写进 task、日志、报告、handoff。
+- local UI 只绑定 `127.0.0.1`，不要暴露到网络。
 
-- `status`: `pending` / `in_progress` / `complete` / `blocked` / `error`
-- `session_id`: Claude Code session id，用于后续 `--resume`
-- `runs`: 已跑几轮
-- `errors`: 连续非额度错误次数
-- `summary`: worker 最后一行 sentinel
-- `resume_summary_next`: `CLAUDE_RESUME_MODE=summary` 下，rate limit 后用于标记下一轮是否用摘要恢复
-- `last`: 最近更新时间
+诚实限制：prompt-level guardrail 不是 OS sandbox。被 prompt injection 或异常行为影响时，worker 仍可能用你给它的权限执行命令。请使用 feature branch、备份、明确的 `done` 命令，以及独立 audit。
 
-如果 task 写错导致状态污染，确认没有 loop 在跑后，可以删除或重置 `state.json`，下次启动会重新初始化。
+## 文件
 
-## 安全约束
-
-脚本的 worker prompt 要求：
-
-- 只编辑 task 的 `dir` 内部。
-- 可以读取 task 明确引用的外部 plan/context 文件。
-- 必须在 feature branch 上提交。
-- 不碰 `main` / `master`，不 force-push，不 merge。
-- 不写出或打印 secret value。
-- 每轮只做一个连贯增量，最后输出一个 sentinel：
-  - `TASK_COMPLETE`
-  - `TASK_BLOCKED: <reason>`
-  - `TASK_PROGRESS: <summary>`
-
-默认权限是 `--dangerously-skip-permissions`，用于无人值守执行。只有在 task 足够明确、目标 repo 是 git repo、且没有明文 secret 时才启动。
-
-其它安全约束：
-
-- **启动前校验**：`run` 会先跑 `validate_tasks`，有硬错误（缺字段、dir 不存在、不是 git repo、id 重复）直接拒绝启动。想允许非 git 目录可设 `REQUIRE_GIT=0`。
-- **锁文件**：`run` 会写 `.auto-loop.lock`（当前 PID）。第二个实例会被拒绝，避免两个 worker 抢同一个 task；PID 已死的陈旧锁会被忽略。
-- **可调环境变量**：`MODEL`、`PERM_FLAGS`、`IDLE_SLEEP`、`RESET_BUFFER`、`MAX_ERRORS`、`CLAUDE_BIN`、`REQUIRE_GIT`、`EDITOR`。
-- `logs/`、`reports/`、`state.json`、`.auto-loop.lock` 都在 `.gitignore` 里，不会被提交。每轮完整 JSON transcript 存在 `logs/<task>-<ts>.json`（可能包含 worker 打印的内容，注意不要让 worker 打印 secret）。
+```text
+auto-loop.sh              # runner: engines, fallback, sessions, audit, reports
+scripts/prepare_tasks.py  # tasks.md -> tasks.json compiler
+ui-server.py              # 标准库本地 UI backend
+ui.html                   # 本地 UI
+tasks.md.example          # 人类友好的任务模板
+tasks.example.json        # JSON 示例
+tasks.md                  # 本地任务源，git-ignored
+tasks.json                # 生成的任务列表，git-ignored
+state.json                # 运行状态，git-ignored
+logs/                     # transcript 和 main log，git-ignored
+reports/                  # markdown 报告，git-ignored
+summaries/                # 上下文 summary，git-ignored
+```

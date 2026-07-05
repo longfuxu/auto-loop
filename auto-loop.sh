@@ -104,15 +104,111 @@ init_state(){
   [ "$count" -gt 0 ] || die "tasks.json has no tasks"
   while IFS= read -r id; do
     if [ "$(jq --arg id "$id" 'has($id)' "$STATE")" != "true" ]; then
-      jq --arg id "$id" '.[$id]={status:"pending",session_id:null,runs:0,errors:0,summary:"",last:"",resume_summary_next:false}' "$STATE" | state_write
+      jq --arg id "$id" '.[$id]={status:"pending",session_id:null,sessions:{},active_engine:"",limited_engines:{},runs:0,errors:0,summary:"",last:"",resume_summary_next:false}' "$STATE" | state_write
     fi
   done < <(jq -r '.tasks[].id' "$TASKS")
+  jq '
+    to_entries
+    | map(.value |= (
+        .sessions = (.sessions // {})
+        | .active_engine = (.active_engine // "")
+        | .limited_engines = (.limited_engines // {})
+        | .resume_summary_next = (.resume_summary_next // false)
+      ))
+    | from_entries
+  ' "$STATE" | state_write
 }
 
 sget(){ jq -r --arg id "$1" ".[\$id].$2 // \"\"" "$STATE"; }   # sget <id> <field>
 sset(){ local id="$1"; shift; jq --arg id "$id" "$@" "$STATE" | state_write; }  # sset <id> [jq args] <filter>
 tget(){ jq -r --arg id "$1" ".tasks[]|select(.id==\$id)|.$2 // \"\"" "$TASKS"; }  # tget <id> <field>
 task_engine(){ local e; e="$(tget "$1" engine)"; [ -z "$e" ] && e="$ENGINE"; echo "$e"; }
+task_fallback_engine(){ local e; e="$(tget "$1" fallback_engine)"; echo "$e"; }
+task_engine_spec(){
+  local id="$1" primary fallback
+  primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
+  [ -n "$fallback" ] && [ "$fallback" != "$primary" ] && printf '%s->%s' "$primary" "$fallback" || printf '%s' "$primary"
+}
+task_engines(){
+  local id="$1" primary fallback
+  primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
+  printf '%s\n' "$primary"
+  [ -n "$fallback" ] && [ "$fallback" != "$primary" ] && printf '%s\n' "$fallback"
+}
+engine_ready(){
+  local b; b="$(engine_bin "$1")"
+  [ -n "$b" ] && command -v "$b" >/dev/null 2>&1
+}
+engine_limit_until(){ jq -r --arg id "$1" --arg e "$2" '.[$id].limited_engines[$e].until // 0' "$STATE"; }
+engine_available(){
+  local until
+  until="$(engine_limit_until "$1" "$2")"
+  [[ "$until" =~ ^[0-9]+$ ]] || return 0
+  [ "$until" -le "$(date +%s)" ]
+}
+task_active_engine(){
+  local id="$1" active e
+  active="$(sget "$id" active_engine)"
+  if [ -n "$active" ]; then
+    while IFS= read -r e; do
+      [ "$e" = "$active" ] && engine_available "$id" "$e" && { echo "$active"; return; }
+    done < <(task_engines "$id")
+  fi
+  while IFS= read -r e; do
+    engine_available "$id" "$e" && { echo "$e"; return; }
+  done < <(task_engines "$id")
+  [ -n "$active" ] && echo "$active" || task_engine "$id"
+}
+task_model_for_engine(){
+  local id="$1" engine="$2" primary fallback model
+  primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
+  if [ "$engine" = "$fallback" ] && [ "$fallback" != "$primary" ]; then
+    model="$(tget "$id" fallback_model)"
+  else
+    model="$(tget "$id" model)"
+  fi
+  [ -z "$model" ] && model="$MODEL"
+  echo "$model"
+}
+session_get(){
+  jq -r --arg id "$1" --arg e "$2" '.[$id].sessions[$e] // ""' "$STATE"
+}
+session_set(){
+  local id="$1" engine="$2" sid="$3"
+  sset "$id" --arg e "$engine" --arg s "$sid" '.[$id].sessions[$e]=$s|.[$id].session_id=$s|.[$id].active_engine=$e'
+}
+record_engine_limit(){
+  local id="$1" engine="$2" until="$3"
+  sset "$id" --arg e "$engine" --argjson until "$until" --arg t "$(ts)" '.[$id].limited_engines[$e]={until:$until,last:$t}|.[$id].summary=("rate limited on "+$e)'
+}
+clear_engine_limit(){
+  local id="$1" engine="$2"
+  sset "$id" --arg e "$engine" 'del(.[$id].limited_engines[$e])'
+}
+switch_to_available_fallback(){
+  local id="$1" limited_engine="$2" e
+  while IFS= read -r e; do
+    [ "$e" = "$limited_engine" ] && continue
+    if engine_available "$id" "$e" && engine_ready "$e"; then
+      sset "$id" --arg e "$e" '.[$id].active_engine=$e'
+      log "[$id] $limited_engine is limited; continuing with fallback engine $e"
+      return 0
+    fi
+    engine_available "$id" "$e" && log "[$id] fallback engine $e is configured but CLI is not available"
+  done < <(task_engines "$id")
+  return 1
+}
+task_next_reset_epoch(){
+  local id="$1" now min="" e until
+  now="$(date +%s)"
+  while IFS= read -r e; do
+    until="$(engine_limit_until "$id" "$e")"
+    [[ "$until" =~ ^[0-9]+$ ]] || continue
+    [ "$until" -le "$now" ] && continue
+    if [ -z "$min" ] || [ "$until" -lt "$min" ]; then min="$until"; fi
+  done < <(task_engines "$id")
+  [ -n "$min" ] && echo "$min" || resolve_reset_epoch
+}
 
 next_task(){                       # first active task in file order
   local id st
@@ -125,7 +221,7 @@ next_task(){                       # first active task in file order
 
 # --- task-spec validation ("check the spec, adjust so it runs best") ---------
 validate_tasks(){
-  local rc=0 n i id dir goal donc eng seen=""
+  local rc=0 n i id dir goal donc eng fallback seen=""
   jq -e '.tasks | type=="array"' "$TASKS" >/dev/null 2>&1 || { log "VALIDATE: .tasks is not an array"; return 1; }
   n="$(jq -r '.tasks | length' "$TASKS")"
   [ "$n" -gt 0 ] || { log "VALIDATE: tasks.json has no tasks"; return 1; }
@@ -135,6 +231,7 @@ validate_tasks(){
     goal="$(jq -r ".tasks[$i].goal // \"\"" "$TASKS")"
     donc="$(jq -r ".tasks[$i].done // \"\"" "$TASKS")"
     eng="$(jq -r ".tasks[$i].engine // \"\"" "$TASKS")"
+    fallback="$(jq -r ".tasks[$i].fallback_engine // \"\"" "$TASKS")"
     if [ -z "$id" ]; then log "VALIDATE[#$i]: missing id"; rc=1; continue; fi
     [[ "$id" =~ ^[a-z0-9-]+$ ]] || { log "VALIDATE[$id]: id should match ^[a-z0-9-]+$ (slug)"; rc=1; }
     case " $seen " in *" $id "*) log "VALIDATE[$id]: duplicate id"; rc=1;; esac
@@ -142,6 +239,8 @@ validate_tasks(){
     [ -n "$goal" ] || { log "VALIDATE[$id]: empty goal"; rc=1; }
     [ -n "$donc" ] || { log "VALIDATE[$id]: empty done-criteria"; rc=1; }
     case "$eng" in ""|claude|codex) : ;; *) log "VALIDATE[$id]: engine must be claude|codex, got '$eng'"; rc=1;; esac
+    case "$fallback" in ""|claude|codex) : ;; *) log "VALIDATE[$id]: fallback_engine must be claude|codex, got '$fallback'"; rc=1;; esac
+    [ -n "$fallback" ] && [ "$fallback" = "${eng:-$ENGINE}" ] && log "VALIDATE[$id]: WARN fallback_engine matches primary engine: '$fallback'"
     if [ -z "$dir" ]; then log "VALIDATE[$id]: empty dir"; rc=1
     else
       case "$dir" in /*) : ;; *) log "VALIDATE[$id]: dir must be an absolute path: '$dir'"; rc=1;; esac
@@ -177,10 +276,11 @@ task_context_summary(){
 }
 
 write_task_summary(){
-  local id="$1" dir goal donc f tmp sid result line branch
+  local id="$1" dir goal donc f tmp sid result line branch sessions
   dir="$(tget "$id" dir)"; goal="$(tget "$id" goal)"; donc="$(tget "$id" done)"
   f="$(summary_file "$id")"; tmp="$f.tmp"
-  sid="$SESSION_ID"; [ -z "$sid" ] || [ "$sid" = "null" ] && sid="$(sget "$id" session_id)"
+  sid="$SESSION_ID"; [ -z "$sid" ] || [ "$sid" = "null" ] && sid="$(session_get "$id" "$CUR_ENGINE")"
+  sessions="$(jq -c --arg id "$id" '.[$id].sessions // {}' "$STATE")"
   result="$(printf '%s\n' "$RESULT_TEXT" | sed -e 's/[[:cntrl:]]//g' | head -c 4000)"
   line="$(printf '%s\n' "$RESULT_TEXT" | grep -oE 'TASK_(COMPLETE|BLOCKED|PROGRESS).*' | tail -1)"
   branch=""
@@ -192,7 +292,9 @@ write_task_summary(){
     printf -- '- Updated: %s\n' "$(ts)"
     printf -- '- Task dir: `%s`\n' "$dir"
     printf -- '- Current branch: `%s`\n' "${branch:-unknown}"
-    printf -- '- Last known session id: `%s`\n' "${sid:-unknown}"
+    printf -- '- Active engine: `%s`\n' "${CUR_ENGINE:-$(task_active_engine "$id")}"
+    printf -- '- Last known active session id: `%s`\n' "${sid:-unknown}"
+    printf -- '- Sessions by engine: `%s`\n' "$sessions"
     printf -- '- Last sentinel: %s\n\n' "${line:-none}"
     printf '## Goal\n\n%s\n\n' "$goal"
     printf '## Done Criteria\n\n%s\n\n' "$donc"
@@ -208,13 +310,14 @@ write_task_summary(){
 mark_summary_resume_next(){
   local id="$1"
   [ "$CLAUDE_RESUME_MODE" = "summary" ] || return 0
-  [ "$(task_engine "$id")" = "claude" ] || return 0
+  [ "$CUR_ENGINE" = "claude" ] || return 0
   sset "$id" '.[$id].resume_summary_next=true'
   log "[$id] CLAUDE_RESUME_MODE=summary — next worker run will start fresh from $(summary_file "$id")"
 }
 
 clear_summary_resume_next(){
   local id="$1"
+  [ "$CUR_ENGINE" = "claude" ] || return 0
   [ "$(sget "$id" resume_summary_next)" = "true" ] && sset "$id" '.[$id].resume_summary_next=false'
 }
 
@@ -238,11 +341,12 @@ llm_run(){
     [ -n "$model" ] && a+=(--model "$model")
     [ -n "$sid" ] && [ "$sid" != "null" ] && a+=(--resume "$sid")
     ( cd "$dir" && "$CLAUDE_BIN" "${a[@]}" ) > "$out" 2>&1 </dev/null; LLM_EC=$?
-    LLM_RL="$(jq -r 'try (.[]|select(.type=="rate_limit_event")|.rate_limit_info.status) catch empty' "$out" 2>/dev/null | tail -1)"; [ -z "$LLM_RL" ] && LLM_RL="allowed"
-    LLM_RESETS="$(jq -r 'try (.[]|select(.type=="rate_limit_event")|.rate_limit_info.resetsAt) catch empty' "$out" 2>/dev/null | tail -1)"
-    LLM_TEXT="$(jq -r 'try (.[]|select(.type=="result")|.result)   catch empty' "$out" 2>/dev/null | tail -1)"
-    LLM_SID="$(jq -r 'try (.[]|select(.type=="result")|.session_id) catch empty' "$out" 2>/dev/null | tail -1)"
-    [ "$(jq -r 'try (.[]|select(.type=="result")|.is_error) catch empty' "$out" 2>/dev/null | tail -1)" = "true" ] && LLM_ERR="true"
+    LLM_RL="$(jq -r 'try ((if type=="array" then .[] else . end)|select(.type=="rate_limit_event")|.rate_limit_info.status) catch empty' "$out" 2>/dev/null | tail -1)"; [ -z "$LLM_RL" ] && LLM_RL="allowed"
+    LLM_RESETS="$(jq -r 'try ((if type=="array" then .[] else . end)|select(.type=="rate_limit_event")|.rate_limit_info.resetsAt) catch empty' "$out" 2>/dev/null | tail -1)"
+    LLM_TEXT="$(jq -r 'try ((if type=="array" then .[] else . end)|select(.type=="result")|.result)   catch empty' "$out" 2>/dev/null | tail -1)"
+    LLM_SID="$(jq -r 'try ((if type=="array" then .[] else . end)|select(.type=="result")|.session_id) catch empty' "$out" 2>/dev/null | tail -1)"
+    [ "$(jq -r 'try ((if type=="array" then .[] else . end)|select(.type=="result")|.is_error) catch empty' "$out" 2>/dev/null | tail -1)" = "true" ] && LLM_ERR="true"
+    [ "$LLM_EC" -ne 0 ] && [ "$LLM_RL" = "allowed" ] && LLM_ERR="true"
   else  # codex
     local last="$out.last"; : > "$last"
     local prompt="$instr
@@ -264,9 +368,18 @@ $nudge"
 RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT="" CUR_ENGINE=""
 
 run_task(){
-  local id="$1" dir goal donc sid runs model engine hint resume_sid resume_mode summary_text
+  local id="$1" dir goal donc sid runs model engine primary candidate hint resume_sid resume_mode summary_text
   dir="$(tget "$id" dir)"; goal="$(tget "$id" goal)"; donc="$(tget "$id" done)"
-  engine="$(task_engine "$id")"; CUR_ENGINE="$engine"
+  primary="$(task_engine "$id")"; engine="$(task_active_engine "$id")"
+  if ! engine_ready "$engine"; then
+    while IFS= read -r candidate; do
+      if engine_available "$id" "$candidate" && engine_ready "$candidate"; then
+        engine="$candidate"
+        break
+      fi
+    done < <(task_engines "$id")
+  fi
+  CUR_ENGINE="$engine"
   RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT=""
   if [ -z "$dir" ] || [ ! -d "$dir" ]; then
     log "[$id] dir missing or not found: '$dir' — parking as error"
@@ -277,8 +390,9 @@ run_task(){
     sset "$id" --arg d "$dir" '.[$id].status="error"|.[$id].summary=("not a git repo: "+$d)'; return 1
   fi
   require_engine "$engine"
-  sid="$(sget "$id" session_id)"; runs="$(sget "$id" runs)"; resume_sid="$sid"; resume_mode="$CLAUDE_RESUME_MODE"
-  model="$(tget "$id" model)"; [ -z "$model" ] && model="$MODEL"
+  sset "$id" --arg e "$engine" '.[$id].active_engine=$e'
+  sid="$(session_get "$id" "$engine")"; runs="$(sget "$id" runs)"; resume_sid="$sid"; resume_mode="$CLAUDE_RESUME_MODE"
+  model="$(task_model_for_engine "$id" "$engine")"
   hint="$(detect_repo_hint "$dir")"
 
   local instr="You are an unattended coding agent advancing ONE task by a bounded, safe increment. No human is watching this run.
@@ -314,6 +428,16 @@ Use this summary and the repo state as continuity context. Do not assume the ful
 $nudge"
     fi
   fi
+  if [ "$engine" != "$primary" ] && [ -z "$resume_sid" ]; then
+    summary_text="$(task_context_summary "$id")"
+    nudge="This task is continuing on fallback engine '$engine' because '$primary' was rate-limited. Use the repo state as the source of truth.${summary_text:+
+
+Previous context summary for this task:
+
+$summary_text}
+
+$nudge"
+  fi
 
   local out="$LOGDIR/${id}-$(date +%Y%m%d-%H%M%S).json"; RUN_OUT="$out"
   log "[$id] run #$((runs+1)) via $engine in $dir${model:+ model=$model}${resume_sid:+ resume=$resume_sid}${summary_text:+ summary_context=1}"
@@ -339,11 +463,28 @@ resolve_reset_epoch(){
 }
 
 sleep_until_reset(){
-  local epoch now target wait
-  epoch="$(resolve_reset_epoch)"; now="$(date +%s)"; target=$(( epoch + RESET_BUFFER )); wait=$(( target - now ))
+  sleep_until_epoch "$(resolve_reset_epoch)"
+}
+
+sleep_until_epoch(){
+  local epoch="$1" now target wait
+  now="$(date +%s)"; target=$(( epoch + RESET_BUFFER )); wait=$(( target - now ))
   [ "$wait" -lt 30 ] && wait=30
   log "LIMITED — sleeping ${wait}s (~$(( wait/60 ))m) until $(date -r "$target" '+%F %T %Z')"
   sleep "$wait"
+}
+
+handle_rate_limit(){
+  local id="$1" epoch
+  epoch="$(resolve_reset_epoch)"
+  record_engine_limit "$id" "$CUR_ENGINE" "$epoch"
+  [ "$CUR_ENGINE" = "claude" ] && mark_summary_resume_next "$id"
+  if switch_to_available_fallback "$id" "$CUR_ENGINE"; then
+    write_report "rate-limit-fallback" >/dev/null
+    return 0
+  fi
+  write_report "rate-limit-window-end" >/dev/null
+  sleep_until_epoch "$(task_next_reset_epoch "$id")"
 }
 
 # --- independent auditor -----------------------------------------------------
@@ -351,8 +492,8 @@ AUDIT_VERDICT="" AUDIT_REASON=""
 run_audit(){
   local id="$1" dir donc engine model out line
   dir="$(tget "$id" dir)"; donc="$(tget "$id" done)"
-  engine="$AUDIT_ENGINE"; [ -z "$engine" ] && engine="$(task_engine "$id")"
-  model="$AUDIT_MODEL"; [ -z "$model" ] && { model="$(tget "$id" model)"; [ -z "$model" ] && model="$MODEL"; }
+  engine="$AUDIT_ENGINE"; [ -z "$engine" ] && engine="$(task_active_engine "$id")"
+  model="$AUDIT_MODEL"; [ -z "$model" ] && model="$(task_model_for_engine "$id" "$engine")"
   CUR_ENGINE="$engine"; AUDIT_VERDICT=""; AUDIT_REASON=""
   require_engine "$engine"
 
@@ -387,14 +528,14 @@ do_review(){
   case "$AUDIT_VERDICT" in
     pass)         sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="complete"|.[$id].summary=("AUDITED ✓ "+$l)'; log "[$id] COMPLETE (audit passed)";;
     fail)         sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="in_progress"|.[$id].summary=("AUDIT FAILED: "+$l)'; log "[$id] audit FAILED — back to in_progress";;
-    ratelimited)  write_report "audit-rate-limit" >/dev/null; sleep_until_reset;;   # stay 'review', retry
+    ratelimited)  handle_rate_limit "$id";;   # stay 'review', retry
     *)            sset "$id" --arg l "$AUDIT_REASON" '.[$id].status="in_progress"|.[$id].summary=("AUDIT INCONCLUSIVE: "+$l)'; log "[$id] audit inconclusive — back to in_progress";;
   esac
 }
 
 apply_result(){
   local id="$1" line
-  [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && sset "$id" --arg s "$SESSION_ID" '.[$id].session_id=$s'
+  [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && session_set "$id" "$CUR_ENGINE" "$SESSION_ID"
   sset "$id" --arg t "$(ts)" '.[$id].runs=(.[$id].runs+1)|.[$id].last=$t'
   if [ "$IS_ERROR" = "true" ]; then
     local n; n=$(( $(sget "$id" errors) + 1 ))
@@ -404,6 +545,7 @@ apply_result(){
     return
   fi
   sset "$id" '.[$id].errors=0'
+  clear_engine_limit "$id" "$CUR_ENGINE"
   clear_summary_resume_next "$id"
   line="$(printf '%s\n' "$RESULT_TEXT" | grep -oE 'TASK_(COMPLETE|BLOCKED|PROGRESS).*' | tail -1)"
   case "$line" in
@@ -416,15 +558,20 @@ apply_result(){
 
 # --- reports -----------------------------------------------------------------
 write_report(){
-  local reason="${1:-manual}" f id st runs errs last summ dir eng
+  local reason="${1:-manual}" f id st runs errs last summ dir eng active limits
   f="$REPORTDIR/report-$(date +%Y%m%d-%H%M%S).md"
   {
     printf '# auto-loop report\n\n- Generated: %s\n- Trigger: %s\n- Tasks file: `%s`\n\n' "$(ts)" "$reason" "$TASKS"
-    printf '## Task status\n\n| task | engine | status | runs | err | last | summary |\n|------|--------|--------|------|-----|------|---------|\n'
+    printf '## Task status\n\n| task | engine spec | active | status | runs | err | last | summary |\n|------|-------------|--------|--------|------|-----|------|---------|\n'
     while IFS= read -r id; do
       st="$(sget "$id" status)"; runs="$(sget "$id" runs)"; errs="$(sget "$id" errors)"
-      last="$(sget "$id" last)"; eng="$(task_engine "$id")"; summ="$(sget "$id" summary | tr '|' '/' | cut -c1-90)"
-      printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$id" "$eng" "$st" "$runs" "$errs" "${last:-–}" "${summ:-–}"
+      last="$(sget "$id" last)"; eng="$(task_engine_spec "$id")"; active="$(task_active_engine "$id")"; summ="$(sget "$id" summary | tr '|' '/' | cut -c1-90)"
+      printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' "$id" "$eng" "$active" "$st" "$runs" "$errs" "${last:-–}" "${summ:-–}"
+    done < <(jq -r '.tasks[].id' "$TASKS")
+    printf '\n## Limited engines\n\n'
+    while IFS= read -r id; do
+      limits="$(jq -c --arg id "$id" '.[$id].limited_engines // {}' "$STATE")"
+      [ "$limits" = "{}" ] || printf -- '- `%s`: `%s`\n' "$id" "$limits"
     done < <(jq -r '.tasks[].id' "$TASKS")
     printf '\n## Recent commits per task repo\n\n'
     while IFS= read -r id; do
@@ -442,11 +589,11 @@ write_report(){
 cmd_status(){
 	  init_state
 	  printf 'claude resume mode: %s\n' "$CLAUDE_RESUME_MODE"
-	  printf '\n%-24s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE STATUS RUNS ERR SUMMARY
-  printf '%-24s %-7s %-12s %-5s %-4s %s\n' ------------------------ ------- ------------ ----- ---- -------
+	  printf '\n%-24s %-14s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE-SPEC ACTIVE STATUS RUNS ERR SUMMARY
+  printf '%-24s %-14s %-7s %-12s %-5s %-4s %s\n' ------------------------ -------------- ------- ------------ ----- ---- -------
   local id
   while IFS= read -r id; do
-    printf '%-24s %-7s %-12s %-5s %-4s %s\n' "$id" "$(task_engine "$id")" "$(sget "$id" status)" "$(sget "$id" runs)" "$(sget "$id" errors)" "$(sget "$id" summary)"
+    printf '%-24s %-14s %-7s %-12s %-5s %-4s %s\n' "$id" "$(task_engine_spec "$id")" "$(task_active_engine "$id")" "$(sget "$id" status)" "$(sget "$id" runs)" "$(sget "$id" errors)" "$(sget "$id" summary)"
   done < <(jq -r '.tasks[].id' "$TASKS")
   loop_running && printf '\nloop: RUNNING (PID %s)\n\n' "$(loop_pid)" || printf '\nloop: not running\n\n'
 }
@@ -464,11 +611,11 @@ cmd_edit(){
 
 cmd_sessions(){
   init_state
-  printf '\n%-24s %-7s %-12s %-38s %s\n' TASK ENGINE STATUS SESSION_ID DIR
-  local id sid st dir
+  printf '\n%-24s %-14s %-7s %-12s %-46s %s\n' TASK ENGINE-SPEC ACTIVE STATUS SESSIONS DIR
+  local id st dir sessions
   while IFS= read -r id; do
-    st="$(sget "$id" status)"; sid="$(sget "$id" session_id)"; dir="$(tget "$id" dir)"
-    printf '%-24s %-7s %-12s %-38s %s\n' "$id" "$(task_engine "$id")" "$st" "${sid:-–}" "$dir"
+    st="$(sget "$id" status)"; dir="$(tget "$id" dir)"; sessions="$(jq -c --arg id "$id" '.[$id].sessions // {}' "$STATE")"
+    printf '%-24s %-14s %-7s %-12s %-46s %s\n' "$id" "$(task_engine_spec "$id")" "$(task_active_engine "$id")" "$st" "${sessions:-{}}" "$dir"
   done < <(jq -r '.tasks[].id' "$TASKS")
   printf '\nResume any task interactively:  ./auto-loop.sh attach <task>\n\n'
 }
@@ -478,7 +625,7 @@ cmd_attach(){
   local id="${1:-}" dir sid engine bin ans
   [ -n "$id" ] || die "usage: ./auto-loop.sh attach <task-id>  (see: ./auto-loop.sh sessions)"
   jq -e --arg id "$id" '.tasks[]|select(.id==$id)' "$TASKS" >/dev/null 2>&1 || die "no such task: $id"
-  dir="$(tget "$id" dir)"; sid="$(sget "$id" session_id)"; engine="$(task_engine "$id")"; bin="$(engine_bin "$engine")"
+  dir="$(tget "$id" dir)"; engine="$(task_active_engine "$id")"; sid="$(session_get "$id" "$engine")"; bin="$(engine_bin "$engine")"
   [ -d "$dir" ] || die "task dir not found: $dir"
   require_engine "$engine"
   if loop_running; then
@@ -507,14 +654,14 @@ main(){
   acquire_lock
   [ "$PERM_FLAGS" = "--dangerously-skip-permissions" ] && log "NOTE: claude runs with --dangerously-skip-permissions; codex runs with --dangerously-bypass-approvals-and-sandbox. Workers act unattended inside each task dir."
   [ "$AUDIT" = "1" ] && log "AUDIT: on — an independent agent must confirm each TASK_COMPLETE" || log "AUDIT: OFF — completion is self-attested"
-  log "=== auto-loop start === engine=$ENGINE tasks=$(jq -r '[.tasks[].id]|join(",")' "$TASKS")"
+  log "=== auto-loop start === default_engine=$ENGINE tasks=$(jq -r '[.tasks[].id]|join(",")' "$TASKS")"
   while :; do
     local id st
     if ! id="$(next_task)"; then log "=== no active tasks left — stopping ==="; write_report "loop-idle" >/dev/null; cmd_status; break; fi
     st="$(sget "$id" status)"
     if [ "$st" = "review" ]; then do_review "$id"; sleep "$IDLE_SLEEP"; continue; fi
     if ! run_task "$id"; then sleep "$IDLE_SLEEP"; continue; fi
-    if limited; then mark_summary_resume_next "$id"; write_report "rate-limit-window-end" >/dev/null; sleep_until_reset; continue; fi
+    if limited; then handle_rate_limit "$id"; continue; fi
     apply_result "$id"
     sleep "$IDLE_SLEEP"
   done

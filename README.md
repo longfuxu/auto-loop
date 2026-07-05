@@ -2,226 +2,263 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-**Run a list of coding tasks unattended with an agent CLI (Claude Code or OpenAI Codex), sleep through usage-limit windows automatically, and have an independent auditor verify each task is actually done — with a small local web UI for non-coders and a one-command way to jump into any task interactively.**
+Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markdown, run one task at a time, sleep or switch engines when a usage limit is hit, keep per-engine sessions, and require an independent auditor before a task can be marked complete.
+
+`auto-loop` is intentionally small: one readable Bash runner, one stdlib Python UI, one Markdown-to-JSON task compiler. It is for people who still want local CLI control instead of handing every backlog item to a cloud service.
 
 <p align="center">
-  <img src="docs/ui-status.png" alt="auto-loop web UI — live task status with an independent auditor" width="820">
+  <img src="docs/ui-status.png" alt="auto-loop web UI - live task status with an independent auditor" width="820">
   <br>
-  <em>The local web UI. Tasks advance one at a time; when a worker claims a task is done, a separate auditor re-checks every “done” criterion before it can turn <code>complete</code> — that's the <code>review</code> row.</em>
+  <em>Tasks advance one at a time. A worker can only move a task to review; a separate auditor must verify the done criteria before completion.</em>
 </p>
 
----
+## Why It Exists
 
-## Why this exists
+Agent CLIs are useful for bounded coding tasks, but unattended use has three practical problems:
 
-Agent CLIs like **Claude Code** and **Codex** are great at doing one bounded chunk of work at a time. But two things get in the way of leaving them to grind through a real backlog:
+1. **Usage windows stop progress.** If Claude hits a quota window while you are away, the task stalls. Codex has its own quota behavior.
+2. **One provider is not enough.** A task should be able to continue with Codex when Claude is limited, or vice versa, without losing repo context.
+3. **The worker should not grade itself.** A model saying "done" is not verification.
 
-1. **Usage limits.** Every plan has a rolling window (Claude resets on a ~5-hour cycle; Codex has its own quota). Hit the limit and the agent just stops. If you're not sitting there to restart it when the window reopens, you lose hours.
-2. **"Grading its own homework."** When an agent says *"done,"* nothing checked it. Left alone, an agent will happily declare victory on a task it only half-finished — a well-known failure mode of autonomous loops.
+`auto-loop` handles those directly:
 
-`auto-loop` is a small, auditable Bash harness that solves both:
+- It runs a concrete task list sequentially, across as many windows as needed.
+- It stores sessions per task and per engine, so `claude` and `codex` never share a resume id.
+- It can switch to `fallback_engine` when the active engine is rate-limited.
+- It writes local summaries so a fallback run can continue from the repo state and the last known task context.
+- It runs a separate auditor pass before completion.
 
-- It advances your tasks **one at a time**, and when the agent gets rate-limited it **sleeps exactly until the window resets** (reading the reset time from Claude's own events), then **resumes the same session** so the agent continues instead of starting over.
-- When a task's worker claims completion, a **separate, independent auditor agent** re-checks every "done" criterion — runs the tests, reads the diff — before the task is allowed to be marked complete.
-
-The whole thing is ~400 lines of Bash plus a dependency-free Python UI. You can read all of it.
-
-## What it is *not*
-
-It is not a replacement for judgment. It's for tasks that are **well-specified, verifiable, and safe to run unattended on a feature branch**. It is not for tasks that need live decisions, send messages, publish, or require secrets typed in by hand.
-
----
-
-## How it works
+## How It Works
 
 ```
-tasks.json ──► auto-loop.sh ──► agent CLI (claude | codex)  ──► commits on a feature branch
-    ▲               │  ▲            (non-interactive, one bounded increment per run)
-    │               │  └── usage-limited? sleep until the window resets, then resume same session
-  edit via          │
-  UI or $EDITOR     ├── worker says TASK_COMPLETE? ──► independent AUDITOR agent verifies "done"
-                    │                                    ├─ PASS ─► complete
-                    │                                    └─ FAIL ─► back to in_progress (worker reworks)
-                    └── writes state.json + a markdown report each window
+tasks.md -> prepare -> tasks.json
+                         |
+                         v
+                   auto-loop.sh
+                         |
+        +----------------+----------------+
+        |                                 |
+  worker engine                     state/reports
+  claude or codex                   sessions per engine
+        |
+        +-- limit hit? switch to fallback engine if configured
+        |
+        +-- TASK_COMPLETE? -> independent auditor -> pass/fail
 ```
 
-**One task per run, resumable sessions.** Each task keeps its own agent session id. The loop finishes a task across as many windows as it takes before moving to the next.
+The runner is local. It does not bypass usage limits. It either waits until the known reset time or continues with the configured fallback engine.
 
-**Optional summary-based resume for token management.** By default, Claude tasks resume the same session with `--resume`. Set `CLAUDE_RESUME_MODE=summary` to make rate-limit recovery lighter: after a Claude task hits a usage-limit window, auto-loop marks the next worker run to start a fresh Claude session seeded with a local task summary from `summaries/<task>.md`, instead of forcing the full prior transcript back through resume. Set `CLAUDE_RESUME_MODE=fresh` to always use the summary/fresh-session path when a summary exists.
+## Quick Start
 
-**Two engines, one harness.** Set `"engine": "claude"` or `"engine": "codex"` per task (or a global default). The harness normalizes both:
+Requirements: `bash`, `jq`, `git`, `python3`, and at least one logged-in CLI:
 
-| | Claude Code | Codex |
-|---|---|---|
-| non-interactive call | `claude -p --output-format json` | `codex exec --json` |
-| resume a session | `--resume <id>` | `exec resume <id>` |
-| summary resume | `CLAUDE_RESUME_MODE=summary` starts fresh from `summaries/<task>.md` after a rate-limit pause | not implemented |
-| skip approvals (unattended) | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
-| usage-limit reset | precise `resetsAt` epoch → sleep to it | no epoch exposed → back off `CODEX_COOLDOWN` (default 1h) |
-
-**Independent auditor (the important part).** After a worker emits `TASK_COMPLETE`, the task goes to `review`. A *fresh* auditor agent — no shared session with the worker — is told to distrust the claim, run the exact verification commands in your `done` field, inspect the git diff, and answer `AUDIT_PASS` or `AUDIT_FAIL: <reason>`. Only `AUDIT_PASS` marks the task complete; a fail sends it back to `in_progress` with the reason, so the next worker run fixes it. Toggle with `AUDIT=0`.
-
-**Interactive pickup.** The loop is non-interactive by design (reliable rate-limit and sentinel detection). But because it stores a resumable session id per task, you can open the **normal interactive TUI** on any task at any time:
+- `claude` for Claude Code.
+- `codex` for OpenAI Codex CLI.
 
 ```bash
-./auto-loop.sh stop            # so the loop won't fight you for the session
-./auto-loop.sh attach <task>   # opens `claude --resume <id>` (or `codex resume <id>`) in the task's dir
-# …inspect, chat, steer, fix by hand, then exit the TUI…
-nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &   # let the loop carry on
-```
-
-**Web UI for non-coders.** `./auto-loop.sh ui` serves a local page to add/edit tasks (with validation), watch live status, start/stop the loop, and read the per-window reports — without touching the terminal. The CLI is still the engine; the UI just calls it.
-
-<p align="center">
-  <img src="docs/ui-tasks.png" alt="auto-loop web UI — add and edit tasks with validation" width="820">
-  <br>
-  <em>Add / edit tasks in the browser — id, repo path, goal, checkable “done” criteria, and optional engine/model per task. Saving writes <code>tasks.json</code> and runs the CLI validator.</em>
-</p>
-
----
-
-## Install
-
-Requirements: `bash`, `jq`, `git`, `python3` (for the UI), and at least one agent CLI:
-- **Claude Code** — `claude` on PATH, logged in.
-- **Codex** — `codex` on PATH, logged in (`codex login`).
-
-```bash
-git clone <your-fork-url> auto-loop && cd auto-loop
+git clone <your-fork-url> auto-loop
+cd auto-loop
 cp tasks.md.example tasks.md
-$EDITOR tasks.md            # human-friendly; multiline text is fine
-./auto-loop.sh prepare      # writes canonical tasks.json
-./auto-loop.sh validate     # check your tasks before running
+$EDITOR tasks.md
+TASK_PREPARE_LLM=off ./auto-loop.sh prepare
+./auto-loop.sh validate
+./auto-loop.sh run
 ```
 
-## Task format
+## Task Format
 
-Prefer editing `tasks.md`; `tasks.json` is the generated canonical file used by
-the runner. This avoids JSON escaping mistakes such as raw newlines inside
-strings or trailing commas.
-
-`tasks.md`:
+Prefer editing `tasks.md`. `tasks.json` is generated and used by the runner.
 
 ```md
-## my-feature
+## build-settings-panel
 
 dir: /absolute/path/to/a/git/repo
+
+<!--
+Engine options:
+- engine: claude
+- engine: codex
+
+Model examples, passed through to the selected CLI:
+- Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
+- Codex: gpt-5-codex, gpt-5
+
+Leave engine/model blank to use the global default/account default.
+Use fallback_engine/fallback_model when you want continuation after a usage limit.
+-->
 engine: claude
+model:
+fallback_engine: codex
+fallback_model:
 
 goal:
-One concrete objective. This can be multiple paragraphs and does not need JSON
-escaping.
+Build the settings panel described in docs/settings-plan.md.
 
 done:
-Concrete, auditable completion criteria. Name files and commands, e.g.
-`npm test` passes and `FEATURE_PLAN.md` exists.
+Create and commit the implementation on a feature branch. `npm test` and
+`npm run build` pass. Update HANDOFF.md with the changed files and next command.
 ```
 
-Run `./auto-loop.sh prepare` to compile that Markdown into:
+Fields:
 
-```json
-{
-  "tasks": [
-    {
-      "id": "my-feature",
-      "dir": "/absolute/path/to/a/git/repo",
-      "goal": "One concrete objective.",
-      "done": "Checkable criteria WITH commands, e.g. 'npm run build passes; tests green; committed on a branch'.",
-      "engine": "claude",
-      "model": "claude-opus-4-8"
-    }
-  ]
-}
-```
+- `id`: taken from the `##` heading unless `id:` is provided. Must match `^[a-z0-9-]+$`.
+- `dir`: absolute path to a git repo or worktree.
+- `goal`: concrete objective.
+- `done`: objective verification criteria. Name commands and artifacts.
+- `engine`: optional primary engine, `claude` or `codex`. Defaults to `$ENGINE`, then `claude`.
+- `model`: optional model for the primary engine. Blank means `$MODEL`, then the account default.
+- `fallback_engine`: optional second engine used when the active engine is rate-limited.
+- `fallback_model`: optional model for the fallback engine. Blank means `$MODEL`, then the account default.
 
-`prepare` first parses the Markdown deterministically, then asks the configured
-LLM to clean up task wording and make `done` criteria more objective. The output
-is still validated locally before the loop can start. Set `TASK_PREPARE_LLM=off`
-for deterministic-only generation, or `TASK_PREPARE_LLM=required` if missing LLM
-optimization should be a hard failure.
-
-- `id` — slug, `^[a-z0-9-]+$`, unique.
-- `dir` — absolute path to a **git repo** (the worker commits its work).
-- `goal` / `done` — the more concrete and *verifiable* `done` is, the better the auditor works. Name the exact commands.
-- `engine` *(optional)* — `claude` | `codex`. Defaults to `$ENGINE` (default `claude`).
-- `model` *(optional)* — precedence: task `model` → env `MODEL` → the engine's account default.
-
-Put credentials in the **environment** (e.g. `VERCEL_TOKEN`), never in `tasks.json`, logs, or reports.
-
-## Usage
+Compile and validate:
 
 ```bash
-./auto-loop.sh              # run the loop (foreground)
-./auto-loop.sh prepare      # compile tasks.md -> tasks.json, with LLM cleanup when available
-./auto-loop.sh doctor       # preview prepared JSON without writing tasks.json
-./auto-loop.sh status       # per-task status table + whether the loop is running
-./auto-loop.sh validate     # prepare if needed, then lint tasks.json — non-zero exit on hard errors
-./auto-loop.sh edit         # $EDITOR tasks.md if present, else tasks.json, then re-validate
-./auto-loop.sh sessions     # task -> engine -> session_id -> dir
-./auto-loop.sh attach <id>  # interactive TUI on a task's stored session
-./auto-loop.sh report       # write a status report now (reports/report-<ts>.md)
-./auto-loop.sh ui [port]    # local web UI (default 127.0.0.1:8787)
-./auto-loop.sh stop         # stop a running loop (uses the PID lock)
-
-# unattended background run:
-nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &
-
-# optional Claude token-management mode:
-CLAUDE_RESUME_MODE=summary ./auto-loop.sh
+./auto-loop.sh prepare
+./auto-loop.sh validate
 ```
 
-**Reports** are deterministic markdown digests (no extra agent quota spent) written at each rate-limit window end, when the loop goes idle, and on demand: per-task status/runs/errors/last sentinel + recent commits in each task repo.
+`prepare` parses Markdown deterministically. If enabled, it asks the configured CLI to polish `goal` and `done`, but the deterministic parser remains the source of truth for ids, directories, engines, models, and task count. Set `TASK_PREPARE_LLM=off` for deterministic-only output.
 
-### Environment overrides
+## Engine Fallback
 
-`ENGINE` `MODEL` `PERM_FLAGS` `IDLE_SLEEP` `RESET_BUFFER` `MAX_ERRORS` `CLAUDE_BIN` `CLAUDE_RESUME_MODE` `CODEX_BIN` `CODEX_COOLDOWN` `REQUIRE_GIT` `AUDIT` `AUDIT_MODEL` `AUDIT_ENGINE` `UI_PORT` `EDITOR`.
+When a task hits a usage limit:
 
-`CLAUDE_RESUME_MODE`:
+- Claude: the runner reads `resetsAt` when the CLI exposes it.
+- Codex: the runner uses `CODEX_COOLDOWN` because no precise reset epoch is exposed.
+- If `fallback_engine` is configured and available, the task continues immediately on that engine instead of sleeping.
+- `state.json` stores separate sessions under `sessions.claude` and `sessions.codex`.
+- The fallback run receives the local task summary and must inspect the repo state before continuing.
 
-- `full` (default): keep using Claude Code's normal `--resume <session_id>` behavior.
-- `summary`: use normal `--resume` until a Claude task hits a rate-limit window; after the sleep, start a fresh session with the local summary in `summaries/<task>.md`.
-- `fresh`: always start a fresh Claude session seeded with the local summary when one exists.
+Example:
 
-Claude Code's interactive `/resume` can offer to summarize stale large sessions. The non-interactive CLI currently exposes `--resume` but not a documented `--summary` flag, so auto-loop's summary mode is implemented at the harness layer: it preserves continuity with a small local task summary and repo state instead of relying on a hidden Claude flag.
+```md
+engine: claude
+model: claude-opus-4-8
+fallback_engine: codex
+fallback_model: gpt-5-codex
+```
 
----
+This means: start with Claude, use that model if available, and continue with Codex if Claude is limited.
+
+## Summary Resume
+
+Claude can resume the same non-interactive session with `--resume`. Long sessions can become expensive in context. `auto-loop` adds harness-level summary resume:
+
+```bash
+CLAUDE_RESUME_MODE=summary ./auto-loop.sh run
+```
+
+Modes:
+
+- `full`: default, keep using the stored session id.
+- `summary`: use normal resume until a Claude usage limit occurs; next Claude run starts fresh from `summaries/<task>.md`.
+- `fresh`: always use the local summary when one exists.
+
+The summary file contains task goal, done criteria, last result, active engine, sessions by engine, and recent commits.
+
+## Independent Audit
+
+When a worker prints `TASK_COMPLETE`, the task moves to `review`, not `complete`.
+
+The auditor is a fresh CLI run with a different prompt. It must inspect the repo, run the commands named in `done`, and answer:
+
+- `AUDIT_PASS`
+- `AUDIT_FAIL: <reason>`
+
+Only `AUDIT_PASS` marks the task complete. Disable with `AUDIT=0` only when you are deliberately accepting self-attested completion.
+
+## Local UI
+
+```bash
+./auto-loop.sh ui 8787
+```
+
+The UI binds to `127.0.0.1`, edits tasks, validates them through the CLI, starts/stops the loop, and reads reports. It is a local admin panel; do not expose it to a network.
+
+<p align="center">
+  <img src="docs/ui-tasks.png" alt="auto-loop web UI - task editor" width="820">
+  <br>
+  <em>The UI supports primary engine/model plus fallback engine/model.</em>
+</p>
+
+## Commands
+
+```bash
+./auto-loop.sh run          # foreground run
+./auto-loop.sh prepare      # tasks.md -> tasks.json
+./auto-loop.sh doctor       # preview prepared JSON without writing
+./auto-loop.sh validate     # validate tasks, preparing first if needed
+./auto-loop.sh edit         # edit tasks.md or tasks.json, then validate
+./auto-loop.sh status       # task status, engine spec, active engine
+./auto-loop.sh sessions     # per-task sessions by engine
+./auto-loop.sh attach <id>  # interactive pickup on the active engine session
+./auto-loop.sh report       # write reports/report-<ts>.md
+./auto-loop.sh stop         # stop the lock-file PID
+```
+
+Useful environment variables:
+
+```bash
+ENGINE=claude              # default primary engine when a task omits engine
+MODEL=                     # default model when a task omits model
+CLAUDE_RESUME_MODE=summary # full | summary | fresh
+CODEX_COOLDOWN=3600        # fallback wait for Codex usage limits
+AUDIT=1                    # require independent audit
+AUDIT_ENGINE=              # override auditor engine
+AUDIT_MODEL=               # override auditor model
+REQUIRE_GIT=1              # task dir must be a git repo
+```
+
+## Positioning
+
+`auto-loop` is not trying to be the biggest agent platform. Its edge is the narrow local workflow:
+
+| Type | Representative examples | How they work | auto-loop difference |
+|---|---|---|---|
+| Task queue / rate-limit loop | `claude-queue`, queue-style runners | Python workers, priorities/dependencies, plan-limit monitoring, pause near quota | More focused on Claude+Codex dual engine, per-task sessions, and independent audit |
+| Continuous loop tool | `Ralph` | Repeatedly calls coding agents with exit signals, circuit breakers, resume, logs | Do not compete on "infinite loop"; position as task list + quota sleep/fallback + audit |
+| PR/CI workflow | `Continuous Claude`-style tools | Shared notes, PR creation, CI waiting, merge flow | Lighter, local-first, better for a personal backlog before PR machinery |
+| Graphical command center | CloudCLI, Codexia, async-code-style tools | Web/mobile/desktop control, sessions, parallel tasks, worktrees, remote control | Smaller and more readable: Bash runner plus local stdlib UI |
+| Official async agents | Claude Code on web, Claude routines, OpenAI Codex | Cloud sandbox, GitHub repo access, automatic PRs, parallel tasks | For users who still want local Claude Code/Codex CLI control and local files |
+| Safety/guardrail layer | CC Safety Net-style tools | Hooks block dangerous commands | Complementary; auto-loop's guardrails are prompt-level plus audit, not an OS sandbox |
 
 ## Safety
 
-This tool runs agents **unattended with approvals skipped** (`--dangerously-skip-permissions` / `--dangerously-bypass-approvals-and-sandbox`). That is deliberate — an unattended loop cannot answer permission prompts — but it means **you are trusting the agent to edit and run commands in the task's repo without asking**. Use it only where that trust is acceptable. The design contains the blast radius:
+This tool runs unattended with skipped approvals:
 
-- **Worker guardrails (in the system prompt):** edit only inside the task's `dir`; commit only on a **feature branch**; **never** touch `main`/`master`, never force-push, never merge; never print secrets; keep the repo runnable. *(These are instructions to the model, not a sandbox — see "Honest limitations".)*
-- **Independent verification:** completion is not self-attested. A separate auditor agent must confirm the `done` criteria before a task is `complete` (`AUDIT=1`, on by default).
-- **Startup validation gate:** the loop refuses to start on a malformed spec — missing fields, non-absolute `dir`, a `dir` that isn't a git repo, duplicate ids (`REQUIRE_GIT=0` opts out).
-- **Single-runner lock:** a PID lock file prevents two loops from running the same task list and forking a session; stale locks (dead PID) are ignored.
-- **Secret hygiene:** credentials come from the environment. `state.json`, `logs/`, `reports/`, and the lock file are git-ignored. Full per-run transcripts are saved under `logs/` (plaintext on disk) — keep the repo private if your prompts or code are sensitive.
-- **The web UI binds to `127.0.0.1` only.** It can edit tasks and start the loop, so treat it as a local admin panel: **do not** port-forward it or expose it to a network. Path names for report files are validated to prevent traversal.
+- Claude: `--dangerously-skip-permissions`
+- Codex: `--dangerously-bypass-approvals-and-sandbox`
 
-### Honest limitations
+Use it only for repos where that is acceptable.
 
-- The worker guardrails are **prompt-level**, not an OS sandbox. Skipping approvals means a misbehaving or prompt-injected agent *could* act outside them. Point it only at repos you're willing to let an agent modify, prefer disposable branches, and keep backups. If you want a real sandbox for Codex, run without the bypass flag (you'll then need to handle approvals).
-- The auditor is another LLM. It catches "the tests don't actually pass / the file was never written" far better than trusting the worker, but it is not a formal proof. Write `done` criteria as concrete commands so the auditor has something objective to run.
-- Codex has no precise reset-time signal like Claude, so its back-off is a fixed cooldown (`CODEX_COOLDOWN`), not a to-the-second wake-up.
+Guardrails:
 
----
+- The worker prompt says to edit only inside the task `dir`.
+- The worker must commit on a feature branch.
+- The worker must not touch `main`/`master`, merge, force-push, or print secrets.
+- Startup validation rejects malformed tasks and non-git dirs unless `REQUIRE_GIT=0`.
+- A PID lock prevents two loops from running the same queue.
+- Credentials should live in the environment, never in task files, logs, reports, or handoff docs.
+
+Honest limitation: prompt-level rules are not a sandbox. A misbehaving or prompt-injected run can still execute local commands with the permissions you gave it. Keep backups, use disposable branches, and write concrete `done` checks.
 
 ## Files
 
 ```
-auto-loop.sh        # the harness: engines, rate-limit sleep, auditor, subcommands
-scripts/prepare_tasks.py  # tasks.md -> tasks.json compiler with optional LLM cleanup
-ui-server.py        # local web UI backend (Python stdlib only; calls auto-loop.sh)
-ui.html             # single-file UI (Tasks / Status / Reports)
-tasks.md.example    # human-friendly task template
-tasks.md            # your human-edited task list (you create this; git-ignored)
-tasks.example.json  # copy to tasks.json
-tasks.json          # canonical generated task list (git-ignored)
-state.json          # runtime state (git-ignored, auto-created)
-logs/               # main.log + per-run/audit JSON transcripts (git-ignored)
-reports/            # markdown window reports (git-ignored)
-summaries/          # per-task context summaries for CLAUDE_RESUME_MODE=summary (git-ignored)
+auto-loop.sh              # runner: engines, fallback, sessions, audit, reports
+scripts/prepare_tasks.py  # tasks.md -> tasks.json compiler
+ui-server.py              # dependency-free local UI backend
+ui.html                   # local UI
+tasks.md.example          # human-friendly task template
+tasks.example.json        # JSON schema example
+tasks.md                  # local task source, git-ignored
+tasks.json                # generated task list, git-ignored
+state.json                # runtime state, git-ignored
+logs/                     # transcripts and main log, git-ignored
+reports/                  # markdown reports, git-ignored
+summaries/                # context summaries, git-ignored
 ```
 
 ## License
 
-Apache-2.0 — see `LICENSE` and `NOTICE`.
+Apache-2.0. See `LICENSE` and `NOTICE`.

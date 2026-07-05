@@ -6,7 +6,9 @@
       "goal": "One sentence: what this task should ultimately achieve.",
       "done": "Concrete, checkable completion criteria — e.g. 'npm test passes and feature X works end to end'.",
       "engine": "claude",
-      "model": "claude-opus-4-8"
+      "model": "claude-opus-4-8",
+      "fallback_engine": "codex",
+      "fallback_model": "gpt-5-codex"
     },
     {
       "id": "task-2",
