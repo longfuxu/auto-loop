@@ -108,7 +108,9 @@ done:
 ./auto-loop.sh validate
 ```
 
-`prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径，也不能写入非法的 engine/effort（非法值会退回你的草稿，再不行就丢弃）。
+`prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径。
+
+非法或含糊的 `engine`/`model`/`effort` 会被**修复而不是直接拒绝**，让任务仍可运行：LLM 会映射到合法配置（如 `engine: gpt-5` → `engine: codex` 且 `model: gpt-5-codex`；`effort: very high` → 该引擎的最高档）。每条路径（含 `off`）都有确定性兜底：能识别的 engine 会被归一（`gpt`/`openai` → codex，`anthropic`/`opus`/`sonnet` → claude），effort 同义词改写成规范档位，实在无法校验的就丢弃，让 runner 用默认值继续，而不是启动失败。
 
 AI 生成的方案会缓存在 `.tasks.prepare-cache.json`，以 `tasks.md` 的哈希为键。只要不修改 `tasks.md`，再次 `prepare`（或重启 loop）都会**复用该方案而不再调用 LLM**——即每次编辑只结构化一次，不会每轮重写，省 token。修改 `tasks.md` 即可重新规划；加 `--no-cache` 可强制刷新；用 `PREPARE_MODEL` 指定模型。想完全关闭优化：
 

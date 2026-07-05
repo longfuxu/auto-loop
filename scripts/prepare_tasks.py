@@ -23,29 +23,65 @@ FIELD_RE = re.compile(
 # A model string is passed straight to the CLI's --model flag: keep it to a safe token.
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CACHE_VERSION = 1
+# Effort tokens auto-loop.sh normalize_effort_for_engine accepts verbatim (space-normalized).
+# A value in this set is kept as written; anything else is rewritten to a canonical token
+# via normalize_effort so the runner never rejects it.
+RUNNER_EFFORTS = {
+    "claude": {"low", "medium", "high", "max", "extra", "extra high", "xhigh"},
+    "codex": {"light", "low", "medium", "high", "extra", "extra high", "xhigh"},
+}
 
 
 def normalize_effort(engine: str, raw: str) -> str | None:
-    """Mirror auto-loop.sh normalize_effort_for_engine; return None if invalid."""
+    """Mirror auto-loop.sh normalize_effort_for_engine, plus forgiving synonyms so a
+    slightly-off human/LLM value still resolves to a valid effort. Return None only
+    when nothing sensible can be inferred."""
     if not raw:
         return None
     effort = re.sub(r"[ _-]+", " ", str(raw).strip().lower()).strip()
     if not effort:
         return None
+    # Map common synonyms onto the canonical tiers before per-engine resolution.
+    low_words = {"low", "light", "minimal", "min", "lowest", "quick", "fast"}
+    med_words = {"medium", "med", "moderate", "normal", "default", "standard", "mid"}
+    high_words = {"high"}
+    top_words = {"extra", "extra high", "xhigh", "very high", "highest", "ultra", "max", "maximum", "deep", "thorough"}
     if engine == "claude":
-        if effort in {"low", "medium", "high", "max"}:
-            return effort
-        if effort in {"extra", "extra high", "xhigh"}:
-            return "xhigh"
+        if effort in low_words:
+            return "low"
+        if effort in med_words:
+            return "medium"
+        if effort in high_words:
+            return "high"
+        if effort in top_words:
+            return "max" if effort in {"max", "maximum"} else "xhigh"
         return None
     if engine == "codex":
-        if effort in {"light", "low"}:
+        if effort in low_words:
             return "low"
-        if effort in {"medium", "high"}:
-            return effort
-        if effort in {"extra", "extra high", "xhigh"}:
+        if effort in med_words:
+            return "medium"
+        if effort in high_words:
+            return "high"
+        if effort in top_words:
             return "xhigh"
         return None
+    return None
+
+
+def coerce_engine(raw: str) -> str | None:
+    """Best-effort map a human/LLM engine value onto claude|codex. Recognizes the
+    exact names and common signals (model families, providers). Returns None only
+    when there is no reasonable signal, so the caller falls back to the default."""
+    if not raw:
+        return None
+    value = str(raw).strip().lower()
+    if value in ENGINE_VALUES:
+        return value
+    if re.search(r"codex|gpt|openai|\bo[134]\b|o[134]-", value):
+        return "codex"
+    if re.search(r"claude|anthropic|sonnet|opus|haiku|fable", value):
+        return "claude"
     return None
 
 
@@ -86,11 +122,13 @@ def normalize_task(task: dict, index: int) -> dict:
         if not value:
             continue
         if key == "dir":
-            value = re.sub(r"^//Users/", "/Users/", value)
+            value = os.path.expanduser(re.sub(r"^//Users/", "/Users/", value))
+            if len(value) > 1:
+                value = value.rstrip("/")
         if key in {"engine", "fallback_engine"}:
+            # Keep the raw (lowercased) value; coerce/validate later in sanitize_tasks
+            # so a bad engine is repaired rather than silently dropped.
             value = value.lower()
-            if value not in ENGINE_VALUES:
-                continue
         out[key] = value
     return out
 
@@ -218,9 +256,10 @@ def validate_payload(payload: dict) -> list[dict]:
 
 
 def guard_llm_tasks(tasks: list[dict], draft_tasks: list[dict]) -> list[dict]:
-    """Keep the LLM's improved goal/done/engine/model/effort, but never let it
-    invent an id or a directory, and reject any engine/model/effort it cannot
-    make valid (falling back to the human draft, then omitting)."""
+    """Resolve precedence between the LLM output and the human draft: keep the LLM's
+    improved goal/done/engine/model/effort, but never let it invent an id or a
+    directory. Where the LLM left a field blank, fall back to the human draft.
+    Field *validity* (engine/model/effort) is enforced afterwards by sanitize_tasks."""
     if not draft_tasks or len(tasks) != len(draft_tasks):
         return tasks
     guarded: list[dict] = []
@@ -233,39 +272,74 @@ def guard_llm_tasks(tasks: list[dict], draft_tasks: list[dict]) -> list[dict]:
                 item[key] = draft[key]
             else:
                 item.pop(key, None)
-        # engine / fallback_engine: normalize_task already dropped anything that
-        # is not claude|codex. Keep the LLM's valid choice, else the human draft.
-        for key in ("engine", "fallback_engine"):
+        # engine/model/effort (+fallbacks): keep the LLM's value, else the human's.
+        for key in ("engine", "model", "effort", "fallback_engine", "fallback_model", "fallback_effort"):
             if not item.get(key):
                 if draft.get(key):
                     item[key] = draft[key]
                 else:
                     item.pop(key, None)
-        # model / fallback_model: accept a token-safe model, else the human draft.
-        for key in ("model", "fallback_model"):
-            val = item.get(key)
-            if val and not MODEL_RE.match(val):
-                val = ""
-            if not val:
-                if draft.get(key):
-                    item[key] = draft[key]
-                else:
-                    item.pop(key, None)
-        # effort / fallback_effort: keep only values that normalize for the
-        # resolved engine so the runner never fails validate on a bad effort.
-        engine = item.get("engine") or draft.get("engine") or "claude"
-        fb_engine = item.get("fallback_engine") or draft.get("fallback_engine") or engine
-        for key, eng in (("effort", engine), ("fallback_effort", fb_engine)):
-            val = item.get(key)
-            if val and normalize_effort(eng, val) is not None:
-                continue
-            dval = draft.get(key)
-            if dval and normalize_effort(eng, dval) is not None:
-                item[key] = dval
-            else:
-                item.pop(key, None)
         guarded.append(item)
     return guarded
+
+
+def sanitize_tasks(tasks: list[dict], warn: bool = True) -> list[dict]:
+    """Final safety net applied to every task (deterministic or LLM). Repairs a bad
+    or ambiguous engine into a valid one, and drops any model/effort that still
+    cannot be made valid so the task stays runnable (the runner then uses its
+    default) instead of hard-failing `auto-loop.sh validate`."""
+    def note(msg: str) -> None:
+        if warn:
+            print(f"prepare: {msg}", file=sys.stderr)
+
+    out: list[dict] = []
+    for task in tasks:
+        item = dict(task)
+        tid = item.get("id", "?")
+        # engine / fallback_engine: coerce to a working engine, else use the default.
+        for key in ("engine", "fallback_engine"):
+            raw = item.get(key)
+            if not raw:
+                item.pop(key, None)
+                continue
+            coerced = coerce_engine(raw)
+            if coerced is None:
+                note(f"WARN task '{tid}' {key} '{raw}' not recognized; using the default engine")
+                item.pop(key, None)
+            else:
+                if coerced != str(raw).strip().lower():
+                    note(f"WARN task '{tid}' {key} '{raw}' -> '{coerced}'")
+                item[key] = coerced
+        # Resolve engines (default claude) for effort validation.
+        engine = item.get("engine") or "claude"
+        fb_engine = item.get("fallback_engine") or engine
+        # model / fallback_model: must be a plain CLI token, else drop to default.
+        for key in ("model", "fallback_model"):
+            raw = item.get(key)
+            if not raw:
+                item.pop(key, None)
+            elif not MODEL_RE.match(raw):
+                note(f"WARN task '{tid}' {key} '{raw}' is not a valid model token; dropped (CLI default will be used)")
+                item.pop(key, None)
+        # effort / fallback_effort: keep values the runner already accepts; rewrite
+        # creative synonyms to a canonical token; drop only if nothing maps.
+        for key, eng in (("effort", engine), ("fallback_effort", fb_engine)):
+            raw = item.get(key)
+            if not raw:
+                item.pop(key, None)
+                continue
+            spaced = re.sub(r"[ _-]+", " ", str(raw).strip().lower()).strip()
+            if spaced in RUNNER_EFFORTS.get(eng, set()):
+                continue  # already valid for the runner — keep as written
+            canon = normalize_effort(eng, raw)
+            if canon is None:
+                note(f"WARN task '{tid}' {key} '{raw}' invalid for engine '{eng}'; dropped (default effort will be used)")
+                item.pop(key, None)
+            else:
+                note(f"WARN task '{tid}' {key} '{raw}' -> '{canon}' for engine '{eng}'")
+                item[key] = canon
+        out.append(item)
+    return out
 
 
 def claude_result_text(stdout: str) -> str:
@@ -307,7 +381,8 @@ Rules:
 - Improve the user's task wording without changing intent.
 - Integrate doctor-style cleanup directly: make each goal concrete and make each done criterion objectively auditable.
 - Prefer named output artifacts and concrete verification commands when implied by the task.
-- You MAY set or refine engine/model/effort (and their fallback_* counterparts) to fit the task, but keep the human's explicit choice unless there is a clear reason to change it. Use ONLY engine "claude" or "codex"; effort for claude is one of low|medium|high|extra|max, effort for codex is one of light|medium|high|"extra high". Omit any of these fields you have no basis to set.
+- You MAY set or refine engine/model/effort (and their fallback_* counterparts) to fit the task, but keep the human's explicit choice unless there is a clear reason to change it. Use ONLY engine "claude" or "codex"; effort for claude is one of low|medium|high|extra|max, effort for codex is one of light|medium|high|"extra high".
+- REPAIR bad or ambiguous values into a valid, working configuration — do not just drop them. If the human wrote an engine you do not recognize, infer the right one and keep the original as the model when it names one: e.g. engine "gpt-5"/"gpt-5-codex"/"openai" -> engine "codex" (model "gpt-5-codex" if that is what they meant); engine "claude-opus"/"anthropic"/"sonnet" -> engine "claude". Map effort synonyms to the nearest valid tier (e.g. "very high"/"maximum" -> claude "max" or codex "extra high"; "minimal" -> "low"). Only omit engine/model/effort when you truly have no basis to set them.
 - Output JSON only. No markdown. No commentary.
 
 Human Markdown:
@@ -449,6 +524,10 @@ def main() -> int:
         else:
             print(f"prepare: {exc}", file=sys.stderr)
             return 1
+
+    # Repair/validate engine/model/effort on every path so the written tasks.json
+    # always survives `auto-loop.sh validate` and the loop can actually run.
+    tasks = sanitize_tasks(tasks)
 
     final_payload = {"tasks": tasks}
     if args.dry_run:
