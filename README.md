@@ -2,9 +2,54 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markdown, run one task at a time, reserve usage headroom, sleep or switch engines when a limit is near, keep per-engine sessions, and require an independent auditor before a task can be marked complete.
+A small local task queue that keeps coding-agent work moving when one CLI hits a usage limit.
 
-`auto-loop` is intentionally small: one readable Bash runner, one stdlib Python UI, one Markdown-to-JSON task compiler. It is for people who still want local CLI control instead of handing every backlog item to a cloud service.
+Give it a Markdown backlog. `auto-loop` runs one task at a time with Claude Code or Codex CLI, keeps separate sessions for each engine, switches to a configured fallback engine when the active one is rate-limited, and requires a fresh auditor before a task can be marked complete.
+
+```
+tasks.md
+   |
+   v
+Claude Code ---- usage limit ----> Codex
+   |                                  |
+   +---------- local repo state ------+
+                      |
+                      v
+              independent audit
+                      |
+                pass / retry
+```
+
+## Why I Built It
+
+I wanted to start several coding tasks before leaving my computer and come back to useful progress instead of finding that the queue had stopped at the first usage-limit window.
+
+Three design choices matter:
+
+- **Fail over instead of stall.** A task can continue on Codex when Claude is limited, or vice versa, instead of waiting out the whole reset window.
+- **Keep engine context separate.** Claude and Codex maintain independent per-task sessions and resume state, so a resume id never crosses engines.
+- **The worker cannot grade itself.** `TASK_COMPLETE` only moves a task to review; a fresh auditor must inspect the repo and verify the `done` criteria before it counts as complete.
+
+Everything runs locally. The core is one readable Bash runner, one stdlib Python UI, and one Markdown-to-JSON task compiler — for people who still want local CLI control instead of handing the whole backlog to a cloud service.
+
+## Quick Start
+
+Requirements: `bash`, `jq`, `git`, `python3`, and at least one logged-in CLI:
+
+- `claude` for Claude Code.
+- `codex` for OpenAI Codex CLI.
+
+```bash
+git clone https://github.com/longfuxu/auto-loop.git
+cd auto-loop
+cp tasks.md.example tasks.md
+$EDITOR tasks.md
+./auto-loop.sh prepare            # AI structures the tasks by default; add TASK_PREPARE_LLM=off for deterministic/offline
+./auto-loop.sh validate
+./auto-loop.sh run
+```
+
+Continue below for the detailed task format, engine fallback, usage reserve, audit, and local UI.
 
 <p align="center">
   <img src="docs/ui-status.png" alt="auto-loop web UI - live task status with an independent auditor" width="820">
@@ -17,61 +62,6 @@ Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markd
   <br>
   <em>The CLI is the source of truth: foreground or overnight runs write logs, reports, summaries, and task state locally.</em>
 </p>
-
-## Why It Exists
-
-Agent CLIs are useful for bounded coding tasks, but unattended use has three practical problems:
-
-1. **Usage windows stop progress.** If Claude hits a quota window while you are away, the task stalls. Codex has its own quota behavior.
-2. **One provider is not enough.** A task should be able to continue with Codex when Claude is limited, or vice versa, without losing repo context.
-3. **The worker should not grade itself.** A model saying "done" is not verification.
-4. **You still need personal quota headroom.** Overnight automation should not consume 100% of your daily usage and leave you unable to do manual work.
-
-`auto-loop` handles those directly:
-
-- It runs a concrete task list sequentially, across as many windows as needed.
-- It stores sessions per task and per engine, so `claude` and `codex` never share a resume id.
-- It can switch to `fallback_engine` when the active engine is rate-limited.
-- It defaults to a 90% usage reserve when the CLI exposes utilization, so the loop stops using that engine before consuming the full window.
-- It writes local summaries so a fallback run can continue from the repo state and the last known task context.
-- It runs a separate auditor pass before completion.
-
-## How It Works
-
-```
-tasks.md -> prepare -> tasks.json
-                         |
-                         v
-                   auto-loop.sh
-                         |
-        +----------------+----------------+
-        |                                 |
-  worker engine                     state/reports
-  claude or codex                   sessions per engine
-        |
-        +-- limit hit? switch to fallback engine if configured
-        |
-        +-- TASK_COMPLETE? -> independent auditor -> pass/fail
-```
-
-The runner is local. It does not bypass usage limits. It either waits until the known reset time or continues with the configured fallback engine.
-
-## Quick Start
-
-Requirements: `bash`, `jq`, `git`, `python3`, and at least one logged-in CLI:
-
-- `claude` for Claude Code.
-- `codex` for OpenAI Codex CLI.
-
-```bash
-git clone <your-fork-url> auto-loop
-cd auto-loop
-cp tasks.md.example tasks.md
-$EDITOR tasks.md
-./auto-loop.sh prepare            # AI structures the tasks by default; add TASK_PREPARE_LLM=off for deterministic/offline
-./auto-loop.sh validate
-./auto-loop.sh run
-```
 
 ## Task Format
 

@@ -2,22 +2,54 @@
 
 [English](README.md) · **简体中文**
 
-`auto-loop` 是一个本地任务队列：用 Markdown 写 backlog，让 Claude Code 或 OpenAI Codex CLI 一个 task 一个 task 地跑；撞到或接近 usage limit 时可以保留额度、睡到窗口恢复，也可以切到另一个 engine 继续；每个 task/engine 单独保存 session；worker 说完成以后，还要由独立 auditor 验证才算完成。
+一个小而本地的任务队列：某个 coding-agent CLI 撞到 usage limit 时，让工作继续往前推，而不是卡在原地。
 
-它不是大型 agent 平台，而是一个小而可读的本地 harness：一个 Bash runner、一个标准库 Python UI、一个 `tasks.md -> tasks.json` 编译器。适合仍然想保留本地 Claude Code / Codex CLI 控制权的人。
+给它一份 Markdown backlog。`auto-loop` 用 Claude Code 或 Codex CLI 一次跑一个任务，为每个 engine 分别保存 session，在 active engine 被限流时切换到配置好的 fallback engine，并且要求一个全新的 auditor 验证过后才能把任务标记为完成。
 
-## 核心卖点
+```
+tasks.md
+   |
+   v
+Claude Code ---- usage limit ----> Codex
+   |                                  |
+   +---------- local repo state ------+
+                      |
+                      v
+              independent audit
+                      |
+                pass / retry
+```
 
-- **Markdown 任务入口**：写 `tasks.md`，不用手写 JSON。
-- **双引擎**：每个 task 可选 `claude` 或 `codex`。
-- **模型可配置**：每个 task 可写 `model:`，不填就用全局默认或账号默认。
-- **effort 可配置**：每个 task 可写 `effort:`；Claude 支持 `low/medium/high/extra/max`，Codex 支持 `light/medium/high/extra high`。
-- **额度限制后切换引擎**：`fallback_engine: codex` 可以让 Claude hit limit 后由 Codex 接着做，反过来也可以。
-- **默认保留 10% 额度**：默认 `USAGE_LIMIT_THRESHOLD=0.90`，CLI 暴露 utilization 时，达到 90% 就把该 engine 视为暂时 limited，给日常手动工作留余量。
-- **per-task / per-engine session**：`state.json` 里分别保存 `sessions.claude` 和 `sessions.codex`，不会把一个 engine 的 resume id 误传给另一个。
-- **摘要恢复**：长任务可用 `CLAUDE_RESUME_MODE=summary`，用本地 summary 控制上下文体积。
-- **独立审计**：worker 输出 `TASK_COMPLETE` 后只是进 `review`，必须另一个 auditor 跑验证命令后给 `AUDIT_PASS` 才 complete。
-- **本地 UI**：`./auto-loop.sh ui` 起只绑定 `127.0.0.1` 的小网页，可编辑任务、看状态、看报告、启停 loop。
+## 为什么做这个
+
+我想在离开电脑前起好几个 coding task，回来看到的是实际进展——而不是队列在第一个 usage-limit 窗口就卡死了。
+
+三个设计选择比较关键：
+
+- **限流就切换，而不是卡死。** Claude 被限流时任务可以换到 Codex 继续，反过来也一样，不用干等整个 reset 窗口。
+- **engine 之间的上下文互不干扰。** Claude 和 Codex 分别维护自己的 per-task session 和 resume 状态，resume id 永远不会跨 engine 串用。
+- **worker 不能给自己判分。** worker 输出 `TASK_COMPLETE` 只会把任务推进到 `review`；必须有一个全新的 auditor 检查 repo 并验证 `done` 标准，才算真正完成。
+
+全部在本地跑：一个可读的 Bash runner、一个标准库 Python UI、一个 Markdown-to-JSON 编译器。适合仍然想保留本地 Claude Code / Codex CLI 控制权、不想把整个 backlog 交给云服务的人。
+
+## 快速开始
+
+依赖：`bash`、`jq`、`git`、`python3`，以及至少一个已登录的 CLI：
+
+- `claude`
+- `codex`
+
+```bash
+git clone https://github.com/longfuxu/auto-loop.git
+cd auto-loop
+cp tasks.md.example tasks.md
+$EDITOR tasks.md
+./auto-loop.sh prepare            # 默认由 AI 结构化任务；加 TASK_PREPARE_LLM=off 走确定性/离线
+./auto-loop.sh validate
+./auto-loop.sh run
+```
+
+接下来是详细的任务格式、引擎切换、额度保留、独立审计和本地 UI 说明。
 
 <p align="center">
   <img src="docs/ui-status.png" alt="auto-loop web UI - task status" width="820">
@@ -30,23 +62,6 @@
   <br>
   <em>命令行模式适合睡前或远程运行：能看到 prepare、usage limit、sleep、audit、report 的完整链路。</em>
 </p>
-
-## 快速开始
-
-依赖：`bash`、`jq`、`git`、`python3`，以及至少一个已登录的 CLI：
-
-- `claude`
-- `codex`
-
-```bash
-git clone <your-fork-url> auto-loop
-cd auto-loop
-cp tasks.md.example tasks.md
-$EDITOR tasks.md
-./auto-loop.sh prepare            # 默认由 AI 结构化任务；加 TASK_PREPARE_LLM=off 走确定性/离线
-./auto-loop.sh validate
-./auto-loop.sh run
-```
 
 ## tasks.md 写法
 
