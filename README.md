@@ -47,12 +47,15 @@ tasks.json ──► auto-loop.sh ──► agent CLI (claude | codex)  ──�
 
 **One task per run, resumable sessions.** Each task keeps its own agent session id. The loop finishes a task across as many windows as it takes before moving to the next.
 
+**Optional summary-based resume for token management.** By default, Claude tasks resume the same session with `--resume`. Set `CLAUDE_RESUME_MODE=summary` to make rate-limit recovery lighter: after a Claude task hits a usage-limit window, auto-loop marks the next worker run to start a fresh Claude session seeded with a local task summary from `summaries/<task>.md`, instead of forcing the full prior transcript back through resume. Set `CLAUDE_RESUME_MODE=fresh` to always use the summary/fresh-session path when a summary exists.
+
 **Two engines, one harness.** Set `"engine": "claude"` or `"engine": "codex"` per task (or a global default). The harness normalizes both:
 
 | | Claude Code | Codex |
 |---|---|---|
 | non-interactive call | `claude -p --output-format json` | `codex exec --json` |
 | resume a session | `--resume <id>` | `exec resume <id>` |
+| summary resume | `CLAUDE_RESUME_MODE=summary` starts fresh from `summaries/<task>.md` after a rate-limit pause | not implemented |
 | skip approvals (unattended) | `--dangerously-skip-permissions` | `--dangerously-bypass-approvals-and-sandbox` |
 | usage-limit reset | precise `resetsAt` epoch → sleep to it | no epoch exposed → back off `CODEX_COOLDOWN` (default 1h) |
 
@@ -162,13 +165,24 @@ Put credentials in the **environment** (e.g. `VERCEL_TOKEN`), never in `tasks.js
 
 # unattended background run:
 nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &
+
+# optional Claude token-management mode:
+CLAUDE_RESUME_MODE=summary ./auto-loop.sh
 ```
 
 **Reports** are deterministic markdown digests (no extra agent quota spent) written at each rate-limit window end, when the loop goes idle, and on demand: per-task status/runs/errors/last sentinel + recent commits in each task repo.
 
 ### Environment overrides
 
-`ENGINE` `MODEL` `PERM_FLAGS` `IDLE_SLEEP` `RESET_BUFFER` `MAX_ERRORS` `CLAUDE_BIN` `CODEX_BIN` `CODEX_COOLDOWN` `REQUIRE_GIT` `AUDIT` `AUDIT_MODEL` `AUDIT_ENGINE` `UI_PORT` `EDITOR`.
+`ENGINE` `MODEL` `PERM_FLAGS` `IDLE_SLEEP` `RESET_BUFFER` `MAX_ERRORS` `CLAUDE_BIN` `CLAUDE_RESUME_MODE` `CODEX_BIN` `CODEX_COOLDOWN` `REQUIRE_GIT` `AUDIT` `AUDIT_MODEL` `AUDIT_ENGINE` `UI_PORT` `EDITOR`.
+
+`CLAUDE_RESUME_MODE`:
+
+- `full` (default): keep using Claude Code's normal `--resume <session_id>` behavior.
+- `summary`: use normal `--resume` until a Claude task hits a rate-limit window; after the sleep, start a fresh session with the local summary in `summaries/<task>.md`.
+- `fresh`: always start a fresh Claude session seeded with the local summary when one exists.
+
+Claude Code's interactive `/resume` can offer to summarize stale large sessions. The non-interactive CLI currently exposes `--resume` but not a documented `--summary` flag, so auto-loop's summary mode is implemented at the harness layer: it preserves continuity with a small local task summary and repo state instead of relying on a hidden Claude flag.
 
 ---
 
@@ -205,6 +219,7 @@ tasks.json          # canonical generated task list (git-ignored)
 state.json          # runtime state (git-ignored, auto-created)
 logs/               # main.log + per-run/audit JSON transcripts (git-ignored)
 reports/            # markdown window reports (git-ignored)
+summaries/          # per-task context summaries for CLAUDE_RESUME_MODE=summary (git-ignored)
 ```
 
 ## License

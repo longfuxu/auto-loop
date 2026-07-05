@@ -35,8 +35,9 @@
 # Config: tasks.json (see tasks.example.json). Runtime state: state.json.
 # Logs: logs/. Reports: reports/. Lock: .auto-loop.lock.
 # Env overrides: ENGINE, MODEL, PERM_FLAGS, IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS,
-#   CLAUDE_BIN, CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT, AUDIT, AUDIT_MODEL,
-#   AUDIT_ENGINE, UI_PORT, EDITOR, TASKS_MD, TASK_PREPARE_LLM, PREPARE_MODEL.
+#   CLAUDE_BIN, CLAUDE_RESUME_MODE, CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT,
+#   AUDIT, AUDIT_MODEL, AUDIT_ENGINE, UI_PORT, EDITOR, TASKS_MD,
+#   TASK_PREPARE_LLM, PREPARE_MODEL.
 
 set -uo pipefail
 
@@ -46,12 +47,14 @@ TASKS_MD="${TASKS_MD:-$ROOT/tasks.md}"
 STATE="${STATE_FILE:-$ROOT/state.json}"
 LOGDIR="$ROOT/logs"
 REPORTDIR="$ROOT/reports"
+SUMMARYDIR="$ROOT/summaries"
 LOCKFILE="$ROOT/.auto-loop.lock"
 PREPARE_SCRIPT="$ROOT/scripts/prepare_tasks.py"
-mkdir -p "$LOGDIR" "$REPORTDIR"
+mkdir -p "$LOGDIR" "$REPORTDIR" "$SUMMARYDIR"
 
 ENGINE="${ENGINE:-claude}"             # default agent engine: claude | codex
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+CLAUDE_RESUME_MODE="${CLAUDE_RESUME_MODE:-full}"  # full | summary | fresh
 CODEX_BIN="${CODEX_BIN:-codex}"
 MODEL="${MODEL:-}"                     # empty -> per-task model, else account default
 PERM_FLAGS="${PERM_FLAGS:---dangerously-skip-permissions}"  # claude: unattended, no prompts
@@ -71,6 +74,7 @@ die(){ log "FATAL: $*"; exit 1; }
 
 command -v jq >/dev/null || die "jq not found on PATH"
 [ -f "$TASKS" ] || [ -f "$TASKS_MD" ] || die "missing $TASKS — copy tasks.md.example to tasks.md and run ./auto-loop.sh prepare (or copy tasks.example.json to tasks.json)"
+case "$CLAUDE_RESUME_MODE" in full|summary|fresh) : ;; *) die "CLAUDE_RESUME_MODE must be full|summary|fresh, got '$CLAUDE_RESUME_MODE'";; esac
 
 engine_bin(){ case "$1" in claude) echo "$CLAUDE_BIN";; codex) echo "$CODEX_BIN";; *) echo "";; esac; }
 require_engine(){ local b; b="$(engine_bin "$1")"; [ -n "$b" ] || die "unknown engine: '$1' (use claude|codex)"; command -v "$b" >/dev/null || die "$1 CLI not found ($b)"; }
@@ -100,7 +104,7 @@ init_state(){
   [ "$count" -gt 0 ] || die "tasks.json has no tasks"
   while IFS= read -r id; do
     if [ "$(jq --arg id "$id" 'has($id)' "$STATE")" != "true" ]; then
-      jq --arg id "$id" '.[$id]={status:"pending",session_id:null,runs:0,errors:0,summary:"",last:""}' "$STATE" | state_write
+      jq --arg id "$id" '.[$id]={status:"pending",session_id:null,runs:0,errors:0,summary:"",last:"",resume_summary_next:false}' "$STATE" | state_write
     fi
   done < <(jq -r '.tasks[].id' "$TASKS")
 }
@@ -164,6 +168,56 @@ detect_repo_hint(){
   [ -n "$h" ] && printf 'Detected in this repo:%s.' "${h# ; }"
 }
 
+summary_file(){ printf '%s/%s.md' "$SUMMARYDIR" "$1"; }
+
+task_context_summary(){
+  local id="$1" f
+  f="$(summary_file "$id")"
+  [ -s "$f" ] && cat "$f"
+}
+
+write_task_summary(){
+  local id="$1" dir goal donc f tmp sid result line branch
+  dir="$(tget "$id" dir)"; goal="$(tget "$id" goal)"; donc="$(tget "$id" done)"
+  f="$(summary_file "$id")"; tmp="$f.tmp"
+  sid="$SESSION_ID"; [ -z "$sid" ] || [ "$sid" = "null" ] && sid="$(sget "$id" session_id)"
+  result="$(printf '%s\n' "$RESULT_TEXT" | sed -e 's/[[:cntrl:]]//g' | head -c 4000)"
+  line="$(printf '%s\n' "$RESULT_TEXT" | grep -oE 'TASK_(COMPLETE|BLOCKED|PROGRESS).*' | tail -1)"
+  branch=""
+  if [ -d "$dir/.git" ] || ( cd "$dir" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1 ); then
+    branch="$(cd "$dir" && git branch --show-current 2>/dev/null)"
+  fi
+  {
+    printf '# auto-loop context summary: %s\n\n' "$id"
+    printf -- '- Updated: %s\n' "$(ts)"
+    printf -- '- Task dir: `%s`\n' "$dir"
+    printf -- '- Current branch: `%s`\n' "${branch:-unknown}"
+    printf -- '- Last known session id: `%s`\n' "${sid:-unknown}"
+    printf -- '- Last sentinel: %s\n\n' "${line:-none}"
+    printf '## Goal\n\n%s\n\n' "$goal"
+    printf '## Done Criteria\n\n%s\n\n' "$donc"
+    printf '## Last Worker Result\n\n%s\n\n' "${result:-No result text captured.}"
+    if [ -d "$dir/.git" ] || ( cd "$dir" 2>/dev/null && git rev-parse --git-dir >/dev/null 2>&1 ); then
+      printf '## Recent Commits\n\n```\n'
+      ( cd "$dir" && git log --oneline -5 2>/dev/null )
+      printf '```\n'
+    fi
+  } > "$tmp" && mv "$tmp" "$f"
+}
+
+mark_summary_resume_next(){
+  local id="$1"
+  [ "$CLAUDE_RESUME_MODE" = "summary" ] || return 0
+  [ "$(task_engine "$id")" = "claude" ] || return 0
+  sset "$id" '.[$id].resume_summary_next=true'
+  log "[$id] CLAUDE_RESUME_MODE=summary — next worker run will start fresh from $(summary_file "$id")"
+}
+
+clear_summary_resume_next(){
+  local id="$1"
+  [ "$(sget "$id" resume_summary_next)" = "true" ] && sset "$id" '.[$id].resume_summary_next=false'
+}
+
 # --- lock --------------------------------------------------------------------
 loop_pid(){ [ -f "$LOCKFILE" ] && cat "$LOCKFILE" 2>/dev/null; }
 loop_running(){ local p; p="$(loop_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
@@ -210,7 +264,7 @@ $nudge"
 RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT="" CUR_ENGINE=""
 
 run_task(){
-  local id="$1" dir goal donc sid runs model engine hint
+  local id="$1" dir goal donc sid runs model engine hint resume_sid resume_mode summary_text
   dir="$(tget "$id" dir)"; goal="$(tget "$id" goal)"; donc="$(tget "$id" done)"
   engine="$(task_engine "$id")"; CUR_ENGINE="$engine"
   RL_STATUS="" RESETS_AT="" IS_ERROR="" RESULT_TEXT="" SESSION_ID="" RUN_OUT=""
@@ -223,7 +277,7 @@ run_task(){
     sset "$id" --arg d "$dir" '.[$id].status="error"|.[$id].summary=("not a git repo: "+$d)'; return 1
   fi
   require_engine "$engine"
-  sid="$(sget "$id" session_id)"; runs="$(sget "$id" runs)"
+  sid="$(sget "$id" session_id)"; runs="$(sget "$id" runs)"; resume_sid="$sid"; resume_mode="$CLAUDE_RESUME_MODE"
   model="$(tget "$id" model)"; [ -z "$model" ] && model="$MODEL"
   hint="$(detect_repo_hint "$dir")"
 
@@ -238,9 +292,32 @@ TASK_BLOCKED: <one-line reason> — you cannot proceed without a human decision/
 TASK_PROGRESS: <one-line summary of what you did this run> — otherwise"
   local nudge="Advance this task by one meaningful, safe increment now. First inspect the current state (git status/log, recent files) so you continue rather than restart. Do the next chunk, verify it, commit on a branch. Then output your single sentinel line."
 
+  if [ "$engine" = "claude" ]; then
+    if [ "$resume_mode" = "fresh" ]; then
+      resume_sid=""
+      summary_text="$(task_context_summary "$id")"
+    elif [ "$resume_mode" = "summary" ] && [ "$(sget "$id" resume_summary_next)" = "true" ]; then
+      summary_text="$(task_context_summary "$id")"
+      if [ -n "$summary_text" ]; then
+        resume_sid=""
+      else
+        log "[$id] summary resume requested but no summary exists yet; falling back to full --resume"
+      fi
+    fi
+    if [ -n "$summary_text" ] && [ -z "$resume_sid" ]; then
+      nudge="Previous context summary for this task:
+
+$summary_text
+
+Use this summary and the repo state as continuity context. Do not assume the full previous transcript is available.
+
+$nudge"
+    fi
+  fi
+
   local out="$LOGDIR/${id}-$(date +%Y%m%d-%H%M%S).json"; RUN_OUT="$out"
-  log "[$id] run #$((runs+1)) via $engine in $dir${model:+ model=$model}"
-  llm_run "$engine" "$dir" "$sid" "$model" "$instr" "$nudge" "$out"
+  log "[$id] run #$((runs+1)) via $engine in $dir${model:+ model=$model}${resume_sid:+ resume=$resume_sid}${summary_text:+ summary_context=1}"
+  llm_run "$engine" "$dir" "$resume_sid" "$model" "$instr" "$nudge" "$out"
   RL_STATUS="$LLM_RL"; RESETS_AT="$LLM_RESETS"; IS_ERROR="$LLM_ERR"; RESULT_TEXT="$LLM_TEXT"; SESSION_ID="$LLM_SID"
   log "[$id] exit=$LLM_EC rate_limit=$RL_STATUS is_error=$IS_ERROR"
 }
@@ -317,9 +394,7 @@ do_review(){
 
 apply_result(){
   local id="$1" line
-  if [ "$(sget "$id" session_id)" = "" ] || [ "$(sget "$id" session_id)" = "null" ]; then
-    [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && sset "$id" --arg s "$SESSION_ID" '.[$id].session_id=$s'
-  fi
+  [ -n "$SESSION_ID" ] && [ "$SESSION_ID" != "null" ] && sset "$id" --arg s "$SESSION_ID" '.[$id].session_id=$s'
   sset "$id" --arg t "$(ts)" '.[$id].runs=(.[$id].runs+1)|.[$id].last=$t'
   if [ "$IS_ERROR" = "true" ]; then
     local n; n=$(( $(sget "$id" errors) + 1 ))
@@ -329,12 +404,14 @@ apply_result(){
     return
   fi
   sset "$id" '.[$id].errors=0'
+  clear_summary_resume_next "$id"
   line="$(printf '%s\n' "$RESULT_TEXT" | grep -oE 'TASK_(COMPLETE|BLOCKED|PROGRESS).*' | tail -1)"
   case "$line" in
     TASK_COMPLETE*) sset "$id" --arg l "$line" '.[$id].status="review"|.[$id].summary=$l'; log "[$id] worker claims COMPLETE — queued for audit";;
     TASK_BLOCKED*)  sset "$id" --arg l "$line" '.[$id].status="blocked"|.[$id].summary=$l';  log "[$id] BLOCKED — $line";;
-    *)              sset "$id" --arg l "${line:-TASK_PROGRESS: (no sentinel emitted)}" '.[$id].status="in_progress"|.[$id].summary=$l'; log "[$id] progress — ${line:-<none>}";;
+	    *)              sset "$id" --arg l "${line:-TASK_PROGRESS: (no sentinel emitted)}" '.[$id].status="in_progress"|.[$id].summary=$l'; log "[$id] progress — ${line:-<none>}";;
   esac
+  write_task_summary "$id"
 }
 
 # --- reports -----------------------------------------------------------------
@@ -356,15 +433,16 @@ write_report(){
         printf '```\n'; ( cd "$dir" && git log --oneline -5 2>/dev/null ); printf '```\n\n'
       else printf '_not a git repo_\n\n'; fi
     done < <(jq -r '.tasks[].id' "$TASKS")
-    printf '\n_Logs: `%s`  •  transcripts: `%s/<task>-<ts>.json`  •  audits: `%s/<task>-audit-<ts>.json`_\n' "$LOGDIR/main.log" "$LOGDIR" "$LOGDIR"
+	    printf '\n_Logs: `%s`  •  transcripts: `%s/<task>-<ts>.json`  •  audits: `%s/<task>-audit-<ts>.json`  •  summaries: `%s/<task>.md`_\n' "$LOGDIR/main.log" "$LOGDIR" "$LOGDIR" "$SUMMARYDIR"
   } > "$f"
   log "report written: $f ($reason)"; echo "$f"
 }
 
 # --- subcommands -------------------------------------------------------------
 cmd_status(){
-  init_state
-  printf '\n%-24s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE STATUS RUNS ERR SUMMARY
+	  init_state
+	  printf 'claude resume mode: %s\n' "$CLAUDE_RESUME_MODE"
+	  printf '\n%-24s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE STATUS RUNS ERR SUMMARY
   printf '%-24s %-7s %-12s %-5s %-4s %s\n' ------------------------ ------- ------------ ----- ---- -------
   local id
   while IFS= read -r id; do
@@ -436,7 +514,7 @@ main(){
     st="$(sget "$id" status)"
     if [ "$st" = "review" ]; then do_review "$id"; sleep "$IDLE_SLEEP"; continue; fi
     if ! run_task "$id"; then sleep "$IDLE_SLEEP"; continue; fi
-    if limited; then write_report "rate-limit-window-end" >/dev/null; sleep_until_reset; continue; fi
+    if limited; then mark_summary_resume_next "$id"; write_report "rate-limit-window-end" >/dev/null; sleep_until_reset; continue; fi
     apply_result "$id"
     sleep "$IDLE_SLEEP"
   done

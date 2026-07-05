@@ -10,6 +10,7 @@
 
 - **多引擎**：每个 task 可写 `"engine": "claude"` 或 `"codex"`（不写就用默认）。Claude 读 `resetsAt` 精确睡到窗口恢复；Codex 没有精确 reset，用 `CODEX_COOLDOWN`（默认 1 小时）退避。
 - **独立审计**：worker 说 `TASK_COMPLETE` 后不直接算完成，而是转入 `review`，由**另一个全新的审计 agent**（不共享 session）去跑 `done` 里写的验证命令、看 diff，只有 `AUDIT_PASS` 才标记 complete；失败则打回 `in_progress` 让下轮修。用 `AUDIT=0` 关闭。
+- **摘要恢复 / token management**：默认仍用 Claude Code 的正常 `--resume <session_id>`。如果设置 `CLAUDE_RESUME_MODE=summary`，某个 Claude task 撞到 usage limit 后，下一次恢复会用 `summaries/<task>.md` 里的本地任务摘要开启一个 fresh session，而不是继续塞入完整历史 transcript。这样适合长任务跨多个额度窗口时控制上下文体积。
 - **Web UI（给非程序员）**：`./auto-loop.sh ui` 起一个只绑 `127.0.0.1` 的本地网页，用来加载/编辑任务、看状态、看报告、启停 loop。核心仍然是 CLI。
 
 ## 什么时候适合用
@@ -119,6 +120,9 @@ cd /path/to/auto-loop
 # 后台无人值守运行
 nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &
 
+# Claude token-management 模式：rate limit 后用摘要开启 fresh session
+CLAUDE_RESUME_MODE=summary ./auto-loop.sh
+
 # 看主日志
 tail -f logs/main.log
 
@@ -139,6 +143,16 @@ nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &   # 让 loop 继续
 
 `attach` 打开的就是你现在用的那种交互式 CLI；它续的是 loop 用的同一个 session，所以“从上次离开的地方接着聊”。注意：loop 在跑时不要同时 attach 同一个 task，否则会把会话分叉——`attach` 会检测到锁并要求你确认。
 
+## 摘要恢复 / token management
+
+Claude Code 的交互式 `/resume` 在 stale / large session 场景会提示是否先 summarize，当前非交互 CLI 暴露的是 `--resume`，没有文档化的 `--summary` flag。auto-loop 因此在 harness 层实现了可控的摘要恢复：
+
+- `CLAUDE_RESUME_MODE=full`（默认）：保持旧行为，Claude task 用 `--resume <session_id>` 继续同一个 session。
+- `CLAUDE_RESUME_MODE=summary`：正常情况下仍用 `--resume`；一旦某个 Claude task 撞到 usage limit，loop 会把该 task 标记为“下次摘要恢复”。额度恢复后，它会用 `summaries/<task>.md` 里的本地任务摘要开启 fresh session。
+- `CLAUDE_RESUME_MODE=fresh`：只要已有 summary，就始终用 summary + fresh session，而不是 `--resume`。
+
+每个成功的 worker run 后，auto-loop 会更新 `summaries/<task>.md`，里面包含 task 目标、done 条件、最后一次 worker 结果、最近 commit 等轻量上下文。`summaries/` 已加入 `.gitignore`。
+
 ## 报告
 
 - 每个 5 小时额度窗口结束（loop 进入 sleep 前）、loop 全部跑完、或手动 `./auto-loop.sh report` 时，会在 `reports/` 下写一份 markdown 报告。
@@ -153,6 +167,7 @@ nohup ./auto-loop.sh >> logs/nohup.log 2>&1 &   # 让 loop 继续
 - `runs`: 已跑几轮
 - `errors`: 连续非额度错误次数
 - `summary`: worker 最后一行 sentinel
+- `resume_summary_next`: `CLAUDE_RESUME_MODE=summary` 下，rate limit 后用于标记下一轮是否用摘要恢复
 - `last`: 最近更新时间
 
 如果 task 写错导致状态污染，确认没有 loop 在跑后，可以删除或重置 `state.json`，下次启动会重新初始化。
