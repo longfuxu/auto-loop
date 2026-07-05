@@ -2,7 +2,7 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markdown, run one task at a time, sleep or switch engines when a usage limit is hit, keep per-engine sessions, and require an independent auditor before a task can be marked complete.
+Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markdown, run one task at a time, reserve usage headroom, sleep or switch engines when a limit is near, keep per-engine sessions, and require an independent auditor before a task can be marked complete.
 
 `auto-loop` is intentionally small: one readable Bash runner, one stdlib Python UI, one Markdown-to-JSON task compiler. It is for people who still want local CLI control instead of handing every backlog item to a cloud service.
 
@@ -12,6 +12,12 @@ Local task queue for Claude Code and OpenAI Codex CLI: define a backlog in Markd
   <em>Tasks advance one at a time. A worker can only move a task to review; a separate auditor must verify the done criteria before completion.</em>
 </p>
 
+<p align="center">
+  <img src="docs/cli-run.jpg" alt="auto-loop terminal run showing quota-aware sleep and audit flow" width="820">
+  <br>
+  <em>The CLI is the source of truth: foreground or overnight runs write logs, reports, summaries, and task state locally.</em>
+</p>
+
 ## Why It Exists
 
 Agent CLIs are useful for bounded coding tasks, but unattended use has three practical problems:
@@ -19,12 +25,14 @@ Agent CLIs are useful for bounded coding tasks, but unattended use has three pra
 1. **Usage windows stop progress.** If Claude hits a quota window while you are away, the task stalls. Codex has its own quota behavior.
 2. **One provider is not enough.** A task should be able to continue with Codex when Claude is limited, or vice versa, without losing repo context.
 3. **The worker should not grade itself.** A model saying "done" is not verification.
+4. **You still need personal quota headroom.** Overnight automation should not consume 100% of your daily usage and leave you unable to do manual work.
 
 `auto-loop` handles those directly:
 
 - It runs a concrete task list sequentially, across as many windows as needed.
 - It stores sessions per task and per engine, so `claude` and `codex` never share a resume id.
 - It can switch to `fallback_engine` when the active engine is rate-limited.
+- It defaults to a 90% usage reserve when the CLI exposes utilization, so the loop stops using that engine before consuming the full window.
 - It writes local summaries so a fallback run can continue from the repo state and the last known task context.
 - It runs a separate auditor pass before completion.
 
@@ -83,13 +91,19 @@ Model examples, passed through to the selected CLI:
 - Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
 - Codex: gpt-5-codex, gpt-5
 
-Leave engine/model blank to use the global default/account default.
-Use fallback_engine/fallback_model when you want continuation after a usage limit.
+Effort examples:
+- Claude: low, medium, high, extra, max
+- Codex: light, medium, high, extra high
+
+Leave engine/model/effort blank to use the global default/account default.
+Use fallback_engine/fallback_model/fallback_effort when you want continuation after a usage limit.
 -->
 engine: claude
 model:
+effort:
 fallback_engine: codex
 fallback_model:
+fallback_effort:
 
 goal:
 Build the settings panel described in docs/settings-plan.md.
@@ -107,8 +121,10 @@ Fields:
 - `done`: objective verification criteria. Name commands and artifacts.
 - `engine`: optional primary engine, `claude` or `codex`. Defaults to `$ENGINE`, then `claude`.
 - `model`: optional model for the primary engine. Blank means `$MODEL`, then the account default.
+- `effort`: optional reasoning effort for the primary engine. Claude accepts `low`, `medium`, `high`, `extra`, `max`; Codex accepts `light`, `medium`, `high`, `extra high`.
 - `fallback_engine`: optional second engine used when the active engine is rate-limited.
 - `fallback_model`: optional model for the fallback engine. Blank means `$MODEL`, then the account default.
+- `fallback_effort`: optional effort for the fallback engine. Blank means task `effort`, then `$EFFORT`, then the CLI default.
 
 Compile and validate:
 
@@ -134,11 +150,23 @@ Example:
 ```md
 engine: claude
 model: claude-opus-4-8
+effort: extra
 fallback_engine: codex
 fallback_model: gpt-5-codex
+fallback_effort: high
 ```
 
-This means: start with Claude, use that model if available, and continue with Codex if Claude is limited.
+This means: start with Claude, use that model and effort if available, and continue with Codex if Claude is limited.
+
+## Usage Reserve
+
+By default, the loop treats 90% utilization as a soft limit:
+
+```bash
+USAGE_LIMIT_THRESHOLD=0.90 ./auto-loop.sh run
+```
+
+When the active CLI exposes utilization and reaches this threshold, the current result is still saved, then that engine is marked limited. If a fallback engine is configured, the task continues there. Otherwise the loop sleeps until the reset window. This keeps roughly 10% of the usage window available for normal manual work.
 
 ## Summary Resume
 
@@ -178,7 +206,13 @@ The UI binds to `127.0.0.1`, edits tasks, validates them through the CLI, starts
 <p align="center">
   <img src="docs/ui-tasks.png" alt="auto-loop web UI - task editor" width="820">
   <br>
-  <em>The UI supports primary engine/model plus fallback engine/model.</em>
+  <em>The UI supports primary engine/model/effort plus fallback engine/model/effort.</em>
+</p>
+
+<p align="center">
+  <img src="docs/cli-status.jpg" alt="auto-loop terminal status table showing task state, sessions, and audit summaries" width="820">
+  <br>
+  <em>Terminal status is compact enough for SSH, tmux, or a morning check after an overnight run.</em>
 </p>
 
 ## Commands
@@ -201,13 +235,41 @@ Useful environment variables:
 ```bash
 ENGINE=claude              # default primary engine when a task omits engine
 MODEL=                     # default model when a task omits model
+EFFORT=                    # default effort when a task omits effort
+USAGE_LIMIT_THRESHOLD=0.90 # reserve usage headroom when utilization is exposed
 CLAUDE_RESUME_MODE=summary # full | summary | fresh
 CODEX_COOLDOWN=3600        # fallback wait for Codex usage limits
 AUDIT=1                    # require independent audit
 AUDIT_ENGINE=              # override auditor engine
 AUDIT_MODEL=               # override auditor model
+AUDIT_EFFORT=              # override auditor effort
 REQUIRE_GIT=1              # task dir must be a git repo
 ```
+
+## Overnight Mac Runs
+
+To run before sleep while letting the display turn off:
+
+```bash
+# Plugged in: prevent system sleep, but allow display sleep.
+caffeinate -s ./auto-loop.sh run
+
+# Battery: prevent idle sleep, but expect battery drain.
+caffeinate -i ./auto-loop.sh run
+```
+
+Then turn the display off from another terminal:
+
+```bash
+pmset displaysleepnow
+```
+
+Notes:
+
+- Do not use `caffeinate -d`; it intentionally keeps the display awake.
+- Do not close the laptop lid unless you have a working clamshell setup; closing the lid normally sleeps the Mac.
+- Check active sleep assertions with `pmset -g assertions`.
+- In the morning, run `./auto-loop.sh status` and inspect `reports/`.
 
 ## Positioning
 

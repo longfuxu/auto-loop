@@ -61,11 +61,11 @@
     <div id="taskList"></div>
     <button id="btnAdd">+ Add task</button>
     <button id="btnSave" class="primary">Save &amp; Validate</button>
-    <p class="hint">Saving writes <span class="mono">tasks.json</span> and runs the CLI validator. Fix any hard errors before starting the loop. Engine/model are optional; fallback engine/model let a task continue when the active engine hits a limit.</p>
+    <p class="hint">Saving writes <span class="mono">tasks.json</span> and runs the CLI validator. Fix any hard errors before starting the loop. Engine/model/effort are optional; fallback fields let a task continue when the active engine hits a limit.</p>
   </section>
   <section id="tab-status" style="display:none">
     <div class="card"><table id="statusTable"><thead><tr>
-      <th>Task</th><th>Engine</th><th>Status</th><th>Runs</th><th>Err</th><th>Last</th><th>Summary</th>
+      <th>Task</th><th>Engine</th><th>Model</th><th>Effort</th><th>Status</th><th>Runs</th><th>Err</th><th>Last</th><th>Summary</th>
     </tr></thead><tbody></tbody></table></div>
     <p class="hint">Auto-refreshes every 5s. <b>review</b> = worker claims done, independent auditor is checking. Status is read from <span class="mono">state.json</span>.</p>
   </section>
@@ -97,9 +97,13 @@ function taskCard(t,i){
     <div class="row2"><div><label>Engine (optional)</label><select class="f-engine">
       <option value="">default</option><option value="claude">claude</option><option value="codex">codex</option></select></div>
     <div><label>Model (optional)</label><input class="f-model" placeholder="blank = account default" value="${esc(t.model||"")}"></div></div>
+    <div class="row2"><div><label>Effort (optional)</label><input class="f-effort" placeholder="Claude: low/medium/high/extra/max; Codex: light/medium/high/extra high" value="${esc(t.effort||"")}"></div>
+    <div></div></div>
     <div class="row2"><div><label>Fallback engine (optional)</label><select class="f-fallback-engine">
       <option value="">none</option><option value="claude">claude</option><option value="codex">codex</option></select></div>
-    <div><label>Fallback model (optional)</label><input class="f-fallback-model" placeholder="blank = account default" value="${esc(t.fallback_model||"")}"></div></div>`;
+    <div><label>Fallback model (optional)</label><input class="f-fallback-model" placeholder="blank = account default" value="${esc(t.fallback_model||"")}"></div></div>
+    <div class="row2"><div><label>Fallback effort (optional)</label><input class="f-fallback-effort" placeholder="blank = task/global default" value="${esc(t.fallback_effort||"")}"></div>
+    <div></div></div>`;
   d.querySelector(".f-engine").value=t.engine||"";
   d.querySelector(".f-fallback-engine").value=t.fallback_engine||"";
   d.querySelector(".f-del").onclick=()=>{TASKS.splice(i,1);renderTasks();};
@@ -110,9 +114,9 @@ function renderTasks(){const c=$("#taskList");c.innerHTML="";TASKS.forEach((t,i)
 function collect(){
   return $$("#taskList .card").map(card=>{
     const g=s=>card.querySelector(s).value.trim();const o={id:g(".f-id"),dir:g(".f-dir"),goal:g(".f-goal"),done:g(".f-done")};
-    const m=g(".f-model"),e=card.querySelector(".f-engine").value;
-    const fm=g(".f-fallback-model"),fe=card.querySelector(".f-fallback-engine").value;
-    if(m)o.model=m;if(e)o.engine=e;if(fm)o.fallback_model=fm;if(fe)o.fallback_engine=fe;return o;
+    const m=g(".f-model"),ef=g(".f-effort"),e=card.querySelector(".f-engine").value;
+    const fm=g(".f-fallback-model"),ffe=g(".f-fallback-effort"),fe=card.querySelector(".f-fallback-engine").value;
+    if(m)o.model=m;if(ef)o.effort=ef;if(e)o.engine=e;if(fm)o.fallback_model=fm;if(ffe)o.fallback_effort=ffe;if(fe)o.fallback_engine=fe;return o;
   });
 }
 $("#btnAdd").onclick=()=>{TASKS.push({id:"",dir:"",goal:"",done:""});renderTasks();};
@@ -130,7 +134,9 @@ function renderStatus(){
   TASKS.forEach(t=>{
     const s=STATE[t.id]||{};const tr=document.createElement("tr");
     const spec=(t.engine||"default")+(t.fallback_engine?(" -> "+t.fallback_engine):"");
-    tr.innerHTML=`<td class="mono">${esc(t.id)}</td><td>${esc(spec)}</td>
+    const models=(t.model||"default")+(t.fallback_model?(" -> "+t.fallback_model):"");
+    const efforts=(t.effort||"default")+(t.fallback_effort?(" -> "+t.fallback_effort):"");
+    tr.innerHTML=`<td class="mono">${esc(t.id)}</td><td>${esc(spec)}</td><td>${esc(models)}</td><td>${esc(efforts)}</td>
       <td><span class="st ${esc(s.status||"pending")}">${esc(s.status||"pending")}</span></td>
       <td>${s.runs??0}</td><td>${s.errors??0}</td><td class="muted">${esc(s.last||"–")}</td>
       <td>${esc(s.summary||"–")}</td>`;

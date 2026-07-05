@@ -7,15 +7,18 @@
       "done": "Concrete, checkable completion criteria — e.g. 'npm test passes and feature X works end to end'.",
       "engine": "claude",
       "model": "claude-opus-4-8",
+      "effort": "extra",
       "fallback_engine": "codex",
-      "fallback_model": "gpt-5-codex"
+      "fallback_model": "gpt-5-codex",
+      "fallback_effort": "high"
     },
     {
       "id": "task-2",
       "dir": "/Users/you/path/to/repo-2",
       "goal": "...",
       "done": "...",
-      "engine": "codex"
+      "engine": "codex",
+      "effort": "medium"
     },
     {
       "id": "task-3",

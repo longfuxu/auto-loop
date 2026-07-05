@@ -2,7 +2,7 @@
 
 [English](README.md) · **简体中文**
 
-`auto-loop` 是一个本地任务队列：用 Markdown 写 backlog，让 Claude Code 或 OpenAI Codex CLI 一个 task 一个 task 地跑；撞到 usage limit 时可以睡到窗口恢复，也可以切到另一个 engine 继续；每个 task/engine 单独保存 session；worker 说完成以后，还要由独立 auditor 验证才算完成。
+`auto-loop` 是一个本地任务队列：用 Markdown 写 backlog，让 Claude Code 或 OpenAI Codex CLI 一个 task 一个 task 地跑；撞到或接近 usage limit 时可以保留额度、睡到窗口恢复，也可以切到另一个 engine 继续；每个 task/engine 单独保存 session；worker 说完成以后，还要由独立 auditor 验证才算完成。
 
 它不是大型 agent 平台，而是一个小而可读的本地 harness：一个 Bash runner、一个标准库 Python UI、一个 `tasks.md -> tasks.json` 编译器。适合仍然想保留本地 Claude Code / Codex CLI 控制权的人。
 
@@ -11,11 +11,25 @@
 - **Markdown 任务入口**：写 `tasks.md`，不用手写 JSON。
 - **双引擎**：每个 task 可选 `claude` 或 `codex`。
 - **模型可配置**：每个 task 可写 `model:`，不填就用全局默认或账号默认。
+- **effort 可配置**：每个 task 可写 `effort:`；Claude 支持 `low/medium/high/extra/max`，Codex 支持 `light/medium/high/extra high`。
 - **额度限制后切换引擎**：`fallback_engine: codex` 可以让 Claude hit limit 后由 Codex 接着做，反过来也可以。
+- **默认保留 10% 额度**：默认 `USAGE_LIMIT_THRESHOLD=0.90`，CLI 暴露 utilization 时，达到 90% 就把该 engine 视为暂时 limited，给日常手动工作留余量。
 - **per-task / per-engine session**：`state.json` 里分别保存 `sessions.claude` 和 `sessions.codex`，不会把一个 engine 的 resume id 误传给另一个。
 - **摘要恢复**：长任务可用 `CLAUDE_RESUME_MODE=summary`，用本地 summary 控制上下文体积。
 - **独立审计**：worker 输出 `TASK_COMPLETE` 后只是进 `review`，必须另一个 auditor 跑验证命令后给 `AUDIT_PASS` 才 complete。
 - **本地 UI**：`./auto-loop.sh ui` 起只绑定 `127.0.0.1` 的小网页，可编辑任务、看状态、看报告、启停 loop。
+
+<p align="center">
+  <img src="docs/ui-status.png" alt="auto-loop web UI - task status" width="820">
+  <br>
+  <em>UI 适合非命令行场景；真正的执行状态仍然写在本地 state、logs、reports、summaries 里。</em>
+</p>
+
+<p align="center">
+  <img src="docs/cli-run.jpg" alt="auto-loop terminal run showing quota-aware sleep and audit flow" width="820">
+  <br>
+  <em>命令行模式适合睡前或远程运行：能看到 prepare、usage limit、sleep、audit、report 的完整链路。</em>
+</p>
 
 ## 快速开始
 
@@ -52,13 +66,19 @@ Model examples, passed through to the selected CLI:
 - Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
 - Codex: gpt-5-codex, gpt-5
 
-Leave engine/model blank to use the global default/account default.
-Use fallback_engine/fallback_model when you want continuation after a usage limit.
+Effort examples:
+- Claude: low, medium, high, extra, max
+- Codex: light, medium, high, extra high
+
+Leave engine/model/effort blank to use the global default/account default.
+Use fallback_engine/fallback_model/fallback_effort when you want continuation after a usage limit.
 -->
 engine: claude
 model:
+effort:
 fallback_engine: codex
 fallback_model:
+fallback_effort:
 
 goal:
 实现 docs/settings-plan.md 里描述的 settings panel。
@@ -76,8 +96,10 @@ done:
 - `done`：可验证完成标准，最好写具体命令和文件。
 - `engine`：可选，`claude` 或 `codex`；不填用 `$ENGINE`，再不填默认 `claude`。
 - `model`：可选，传给 primary engine；不填用 `$MODEL`，再不填用账号默认。
+- `effort`：可选，传给 primary engine；Claude 可写 `low`、`medium`、`high`、`extra`、`max`；Codex 可写 `light`、`medium`、`high`、`extra high`。
 - `fallback_engine`：可选，active engine hit limit 后切换到这里。
 - `fallback_model`：可选，传给 fallback engine；不填用 `$MODEL`，再不填用账号默认。
+- `fallback_effort`：可选，传给 fallback engine；不填时先继承同 task 的 `effort`，再用 `$EFFORT`，再用 CLI 默认。
 
 编译和校验：
 
@@ -106,11 +128,23 @@ TASK_PREPARE_LLM=off ./auto-loop.sh prepare
 ```md
 engine: claude
 model: claude-opus-4-8
+effort: extra
 fallback_engine: codex
 fallback_model: gpt-5-codex
+fallback_effort: high
 ```
 
-含义：优先用 Claude 和指定模型；Claude hit limit 后，Codex 接着做。
+含义：优先用 Claude 和指定模型/effort；Claude hit limit 后，Codex 接着做。
+
+## 额度保留
+
+默认软阈值是 90%：
+
+```bash
+USAGE_LIMIT_THRESHOLD=0.90 ./auto-loop.sh run
+```
+
+当 CLI 暴露 utilization 且达到这个阈值时，runner 会先保存当前这次 run 的有效结果，然后把该 engine 记为 limited。配置了 fallback engine 就切过去继续；没有 fallback 就睡到 reset window。这样不会把整个 usage window 吃满，给你白天手动用 Claude/Codex 留出空间。
 
 ## 摘要恢复 / token management
 
@@ -168,13 +202,47 @@ auditor 只能输出：
 ```bash
 ENGINE=claude
 MODEL=
+EFFORT=
+USAGE_LIMIT_THRESHOLD=0.90
 CLAUDE_RESUME_MODE=summary
 CODEX_COOLDOWN=3600
 AUDIT=1
 AUDIT_ENGINE=
 AUDIT_MODEL=
+AUDIT_EFFORT=
 REQUIRE_GIT=1
 ```
+
+## Mac 睡前运行和关屏
+
+想睡前开着 auto-loop，但不让屏幕一直亮：
+
+```bash
+# 插电时：防止系统睡眠，但允许屏幕睡眠。
+caffeinate -s ./auto-loop.sh run
+
+# 只用电池时：防止 idle sleep，但会耗电。
+caffeinate -i ./auto-loop.sh run
+```
+
+然后另开一个 terminal 关屏：
+
+```bash
+pmset displaysleepnow
+```
+
+注意：
+
+- 不要用 `caffeinate -d`，它会刻意保持屏幕常亮。
+- 不要合上 MacBook 盖子，除非你已经有可用的 clamshell 设置；正常合盖会睡眠。
+- 可用 `pmset -g assertions` 检查当前防睡眠断言。
+- 第二天早上运行 `./auto-loop.sh status`，再看 `reports/`。
+
+<p align="center">
+  <img src="docs/cli-status.jpg" alt="auto-loop terminal status table" width="820">
+  <br>
+  <em>早上用 status 快速看每个 task 的状态、runs、audit 结果和摘要。</em>
+</p>
 
 ## 和其它工具的差异
 

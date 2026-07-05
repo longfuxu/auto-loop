@@ -16,7 +16,7 @@ from pathlib import Path
 
 ENGINE_VALUES = {"claude", "codex"}
 FIELD_RE = re.compile(
-    r"^(id|dir|goal|done|engine|model|fallback_engine|fallback_model)\s*:\s*(.*)$",
+    r"^(id|dir|goal|done|engine|model|effort|fallback_engine|fallback_model|fallback_effort)\s*:\s*(.*)$",
     re.I,
 )
 
@@ -40,7 +40,17 @@ def normalize_task(task: dict, index: int) -> dict:
     raw_id = str(task.get("id") or task.get("_heading") or f"task-{index}")
     out["id"] = slugify(raw_id, f"task-{index}")
 
-    for key in ("dir", "goal", "done", "engine", "model", "fallback_engine", "fallback_model"):
+    for key in (
+        "dir",
+        "goal",
+        "done",
+        "engine",
+        "model",
+        "effort",
+        "fallback_engine",
+        "fallback_model",
+        "fallback_effort",
+    ):
         value = task.get(key)
         if value is None:
             continue
@@ -188,7 +198,7 @@ def guard_llm_tasks(tasks: list[dict], draft_tasks: list[dict]) -> list[dict]:
         for key in ("id", "dir"):
             if draft.get(key):
                 item[key] = draft[key]
-        for key in ("engine", "model", "fallback_engine", "fallback_model"):
+        for key in ("engine", "model", "effort", "fallback_engine", "fallback_model", "fallback_effort"):
             if draft.get(key):
                 item[key] = draft[key]
             else:
@@ -225,7 +235,7 @@ def llm_optimize(markdown: str, draft_tasks: list[dict], args: argparse.Namespac
     prompt = f"""You convert a human-written auto-loop task Markdown file into canonical tasks.json.
 
 Return ONLY a JSON object with this exact shape:
-{{"tasks":[{{"id":"slug","dir":"/absolute/path","goal":"...","done":"...","engine":"claude|codex","model":"optional","fallback_engine":"claude|codex","fallback_model":"optional"}}]}}
+{{"tasks":[{{"id":"slug","dir":"/absolute/path","goal":"...","done":"...","engine":"claude|codex","model":"optional","effort":"optional","fallback_engine":"claude|codex","fallback_model":"optional","fallback_effort":"optional"}}]}}
 
 Rules:
 - Preserve explicit task ids when they are valid slugs. If an id is invalid, minimally slugify it.
@@ -235,7 +245,7 @@ Rules:
 - Improve the user's task wording without changing intent.
 - Integrate doctor-style cleanup directly: make each goal concrete and make each done criterion objectively auditable.
 - Prefer named output artifacts and concrete verification commands when implied by the task.
-- Omit engine/model/fallback_engine/fallback_model if absent.
+- Omit engine/model/effort/fallback_engine/fallback_model/fallback_effort if absent.
 - Output JSON only. No markdown. No commentary.
 
 Human Markdown:
