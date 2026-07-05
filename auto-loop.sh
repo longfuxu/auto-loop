@@ -38,7 +38,9 @@
 #   IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS, CLAUDE_BIN, CLAUDE_RESUME_MODE,
 #   CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT, AUDIT, AUDIT_MODEL, AUDIT_ENGINE,
 #   AUDIT_EFFORT, UI_PORT, EDITOR, TASKS_MD,
-#   TASK_PREPARE_LLM, PREPARE_MODEL.
+#   TASK_PREPARE_LLM (on[default]|auto|required|off — 'on' lets the AI restructure
+#     tasks.md, may set engine/model/effort, caches the plan so an unchanged file
+#     is not re-planned), PREPARE_MODEL, TASK_PREPARE_TIMEOUT, PREPARE_LLM_BIN.
 
 set -uo pipefail
 

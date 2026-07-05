@@ -8,9 +8,14 @@ Edit `tasks.md`, then run:
 ```
 
 `prepare` converts this Markdown into `tasks.json`. It first parses the file
-deterministically, then asks the configured LLM to clean up the task wording and
-make `done` criteria more auditable. The final JSON is still validated before a
-loop can start.
+deterministically, then (by default, `TASK_PREPARE_LLM=on`) asks the configured
+LLM to rewrite each task into a more structured, auditable form: it cleans up the
+wording, makes `done` criteria checkable, and may set/refine `engine`, `model`,
+and `effort`. Task ids, dirs, and the task count stay under your control — the
+LLM cannot invent a path or change them. The result is cached (keyed by this
+file's hash), so an unchanged `tasks.md` is structured once and not re-planned on
+later runs. Set `TASK_PREPARE_LLM=off` for deterministic-only output. The final
+JSON is still validated before a loop can start.
 
 ## my-feature
 

@@ -8,6 +8,7 @@
 /tasks.json
 /tasks.md
 /tasks copy.json
+/.tasks.prepare-cache.json
 /.claude/
 .DS_Store
 __pycache__/

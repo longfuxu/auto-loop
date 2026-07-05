@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,33 @@ FIELD_RE = re.compile(
     r"^(id|dir|goal|done|engine|model|effort|fallback_engine|fallback_model|fallback_effort)\s*:\s*(.*)$",
     re.I,
 )
+# A model string is passed straight to the CLI's --model flag: keep it to a safe token.
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CACHE_VERSION = 1
+
+
+def normalize_effort(engine: str, raw: str) -> str | None:
+    """Mirror auto-loop.sh normalize_effort_for_engine; return None if invalid."""
+    if not raw:
+        return None
+    effort = re.sub(r"[ _-]+", " ", str(raw).strip().lower()).strip()
+    if not effort:
+        return None
+    if engine == "claude":
+        if effort in {"low", "medium", "high", "max"}:
+            return effort
+        if effort in {"extra", "extra high", "xhigh"}:
+            return "xhigh"
+        return None
+    if engine == "codex":
+        if effort in {"light", "low"}:
+            return "low"
+        if effort in {"medium", "high"}:
+            return effort
+        if effort in {"extra", "extra high", "xhigh"}:
+            return "xhigh"
+        return None
+    return None
 
 
 def slugify(value: str, fallback: str) -> str:
@@ -190,17 +218,50 @@ def validate_payload(payload: dict) -> list[dict]:
 
 
 def guard_llm_tasks(tasks: list[dict], draft_tasks: list[dict]) -> list[dict]:
+    """Keep the LLM's improved goal/done/engine/model/effort, but never let it
+    invent an id or a directory, and reject any engine/model/effort it cannot
+    make valid (falling back to the human draft, then omitting)."""
     if not draft_tasks or len(tasks) != len(draft_tasks):
         return tasks
     guarded: list[dict] = []
     for task, draft in zip(tasks, draft_tasks):
         item = dict(task)
+        # id and dir stay human-controlled: never let the LLM rename a task or
+        # point an unattended agent at a path the human did not specify.
         for key in ("id", "dir"):
             if draft.get(key):
                 item[key] = draft[key]
-        for key in ("engine", "model", "effort", "fallback_engine", "fallback_model", "fallback_effort"):
-            if draft.get(key):
-                item[key] = draft[key]
+            else:
+                item.pop(key, None)
+        # engine / fallback_engine: normalize_task already dropped anything that
+        # is not claude|codex. Keep the LLM's valid choice, else the human draft.
+        for key in ("engine", "fallback_engine"):
+            if not item.get(key):
+                if draft.get(key):
+                    item[key] = draft[key]
+                else:
+                    item.pop(key, None)
+        # model / fallback_model: accept a token-safe model, else the human draft.
+        for key in ("model", "fallback_model"):
+            val = item.get(key)
+            if val and not MODEL_RE.match(val):
+                val = ""
+            if not val:
+                if draft.get(key):
+                    item[key] = draft[key]
+                else:
+                    item.pop(key, None)
+        # effort / fallback_effort: keep only values that normalize for the
+        # resolved engine so the runner never fails validate on a bad effort.
+        engine = item.get("engine") or draft.get("engine") or "claude"
+        fb_engine = item.get("fallback_engine") or draft.get("fallback_engine") or engine
+        for key, eng in (("effort", engine), ("fallback_effort", fb_engine)):
+            val = item.get(key)
+            if val and normalize_effort(eng, val) is not None:
+                continue
+            dval = draft.get(key)
+            if dval and normalize_effort(eng, dval) is not None:
+                item[key] = dval
             else:
                 item.pop(key, None)
         guarded.append(item)
@@ -239,13 +300,14 @@ Return ONLY a JSON object with this exact shape:
 
 Rules:
 - Preserve explicit task ids when they are valid slugs. If an id is invalid, minimally slugify it.
+- Never invent, change, or add a "dir": copy it verbatim from the deterministic parser draft (the human owns the working directory).
 - Do not add or remove tasks.
 - Do not invent secrets, tokens, credentials, or private paths not present in the input.
 - Normalize accidental //Users/... paths to /Users/...
 - Improve the user's task wording without changing intent.
 - Integrate doctor-style cleanup directly: make each goal concrete and make each done criterion objectively auditable.
 - Prefer named output artifacts and concrete verification commands when implied by the task.
-- Omit engine/model/effort/fallback_engine/fallback_model/fallback_effort if absent.
+- You MAY set or refine engine/model/effort (and their fallback_* counterparts) to fit the task, but keep the human's explicit choice unless there is a clear reason to change it. Use ONLY engine "claude" or "codex"; effort for claude is one of low|medium|high|extra|max, effort for codex is one of light|medium|high|"extra high". Omit any of these fields you have no basis to set.
 - Output JSON only. No markdown. No commentary.
 
 Human Markdown:
@@ -280,17 +342,55 @@ def atomic_write_json(path: Path, payload: dict) -> None:
             os.unlink(tmp_name)
 
 
+def cache_file_for(json_path: Path) -> Path:
+    return json_path.parent / ".tasks.prepare-cache.json"
+
+
+def load_prepare_cache(path: Path, source_hash: str) -> list[dict] | None:
+    """Return the cached LLM-prepared tasks iff the source markdown is unchanged."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("version") != CACHE_VERSION:
+        return None
+    if data.get("source_sha256") != source_hash:
+        return None
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return None
+    try:
+        return validate_payload({"tasks": tasks})
+    except Exception:
+        return None
+
+
+def save_prepare_cache(path: Path, source_hash: str, tasks: list[dict]) -> None:
+    payload = {"version": CACHE_VERSION, "source_sha256": source_hash, "tasks": tasks}
+    try:
+        atomic_write_json(path, payload)
+    except Exception as exc:  # a cache write failure must never fail prepare
+        print(f"prepare: WARN could not write prepare cache: {exc}", file=sys.stderr)
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--root", default=os.getcwd())
     p.add_argument("--markdown", default=None)
     p.add_argument("--json", default=None)
-    p.add_argument("--llm", choices=("auto", "required", "off"), default=os.environ.get("TASK_PREPARE_LLM", "auto"))
+    p.add_argument("--llm", choices=("on", "auto", "required", "off"), default=os.environ.get("TASK_PREPARE_LLM", "on"))
     p.add_argument("--llm-bin", default=None)
     p.add_argument("--model", default=None)
     p.add_argument("--timeout", type=int, default=int(os.environ.get("TASK_PREPARE_TIMEOUT", "180")))
+    p.add_argument("--no-cache", action="store_true", help="ignore and refresh the LLM prepare cache")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+
+    # "on" is the friendly default: LLM-structure the tasks, cache the result so a
+    # live session never re-plans the same input. "off" is deterministic-only.
+    mode = args.llm.lower()
+    llm_enabled = mode != "off"
+    llm_required = mode == "required"
 
     root = Path(args.root).resolve()
     markdown_path = Path(args.markdown).resolve() if args.markdown else root / "tasks.md"
@@ -302,25 +402,38 @@ def main() -> int:
 
     markdown = markdown_path.read_text(encoding="utf-8")
     draft_tasks = parse_markdown(markdown)
-    if not draft_tasks and args.llm == "off":
+    if not draft_tasks and not llm_enabled:
         print("prepare: no tasks parsed from Markdown", file=sys.stderr)
         return 1
 
+    source_hash = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+    cache_path = cache_file_for(json_path)
+
     used_llm = False
+    reused_cache = False
     payload: dict = {"tasks": draft_tasks}
-    if args.llm != "off":
-        try:
-            payload = llm_optimize(markdown, draft_tasks, args)
+    if llm_enabled:
+        cached = None
+        if draft_tasks and not args.no_cache:
+            cached = load_prepare_cache(cache_path, source_hash)
+        if cached is not None:
+            # Written once, not rewritten again while the source is unchanged.
+            payload = {"tasks": cached}
             used_llm = True
-        except Exception as exc:
-            if args.llm == "required" or not draft_tasks:
-                print(f"prepare: {exc}", file=sys.stderr)
-                return 1
-            print(f"prepare: WARN LLM optimization skipped: {exc}", file=sys.stderr)
+            reused_cache = True
+        else:
+            try:
+                payload = llm_optimize(markdown, draft_tasks, args)
+                used_llm = True
+            except Exception as exc:
+                if llm_required or not draft_tasks:
+                    print(f"prepare: {exc}", file=sys.stderr)
+                    return 1
+                print(f"prepare: WARN LLM optimization skipped: {exc}", file=sys.stderr)
 
     try:
         tasks = validate_payload(payload)
-        if used_llm:
+        if used_llm and not reused_cache:
             if len(tasks) != len(draft_tasks):
                 raise ValueError(
                     f"LLM changed task count ({len(draft_tasks)} -> {len(tasks)}); "
@@ -332,6 +445,7 @@ def main() -> int:
             print(f"prepare: WARN LLM output rejected: {exc}; using deterministic draft", file=sys.stderr)
             tasks = validate_payload({"tasks": draft_tasks})
             used_llm = False
+            reused_cache = False
         else:
             print(f"prepare: {exc}", file=sys.stderr)
             return 1
@@ -341,8 +455,15 @@ def main() -> int:
         print(json.dumps(final_payload, ensure_ascii=False, indent=2))
     else:
         atomic_write_json(json_path, final_payload)
-        mode = "LLM-optimized" if used_llm else "deterministic"
-        print(f"prepare: wrote {json_path} from {markdown_path} ({mode})")
+        # Persist the plan only when a fresh LLM pass produced it, so re-running
+        # prepare on the same tasks.md reuses it instead of spending more tokens.
+        if used_llm and not reused_cache:
+            save_prepare_cache(cache_path, source_hash, tasks)
+        if used_llm:
+            mode_label = "LLM-cached" if reused_cache else "LLM-optimized"
+        else:
+            mode_label = "deterministic"
+        print(f"prepare: wrote {json_path} from {markdown_path} ({mode_label})")
     return 0
 
 

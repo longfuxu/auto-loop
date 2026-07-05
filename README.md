@@ -68,7 +68,7 @@ git clone <your-fork-url> auto-loop
 cd auto-loop
 cp tasks.md.example tasks.md
 $EDITOR tasks.md
-TASK_PREPARE_LLM=off ./auto-loop.sh prepare
+./auto-loop.sh prepare            # AI structures the tasks by default; add TASK_PREPARE_LLM=off for deterministic/offline
 ./auto-loop.sh validate
 ./auto-loop.sh run
 ```
@@ -133,7 +133,9 @@ Compile and validate:
 ./auto-loop.sh validate
 ```
 
-`prepare` parses Markdown deterministically. If enabled, it asks the configured CLI to polish `goal` and `done`, but the deterministic parser remains the source of truth for ids, directories, engines, models, and task count. Set `TASK_PREPARE_LLM=off` for deterministic-only output.
+`prepare` parses Markdown deterministically, then — by default (`TASK_PREPARE_LLM=on`) — asks the configured CLI to rewrite each task into a more structured, auditable form: it polishes `goal` and `done` and may set or refine `engine`, `model`, and `effort` (and their `fallback_*` counterparts) to fit the task. The deterministic parser stays the source of truth for **task ids, directories, and task count** — the LLM can never invent a path, rename a task, add/remove tasks, or emit an invalid engine/effort (bad values fall back to your draft, then are dropped).
+
+The AI-written plan is cached in `.tasks.prepare-cache.json`, keyed by a hash of `tasks.md`. As long as you do not change `tasks.md`, re-running `prepare` (or restarting the loop) **reuses that plan without calling the LLM again** — so a task is structured once per edit, not re-planned on every run. This keeps the workflow token-efficient. Edit `tasks.md` to re-plan, pass `--no-cache` to force a refresh, or set `TASK_PREPARE_LLM=off` for deterministic-only output. Override the model with `PREPARE_MODEL`.
 
 ## Engine Fallback
 

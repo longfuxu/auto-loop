@@ -43,7 +43,7 @@ git clone <your-fork-url> auto-loop
 cd auto-loop
 cp tasks.md.example tasks.md
 $EDITOR tasks.md
-TASK_PREPARE_LLM=off ./auto-loop.sh prepare
+./auto-loop.sh prepare            # 默认由 AI 结构化任务；加 TASK_PREPARE_LLM=off 走确定性/离线
 ./auto-loop.sh validate
 ./auto-loop.sh run
 ```
@@ -108,7 +108,9 @@ done:
 ./auto-loop.sh validate
 ```
 
-`prepare` 先用确定性 parser 解析 Markdown。如果启用优化 pass，它只允许润色 `goal` / `done`；task 数量、id、dir、engine、model 仍以确定性 parser 为准。想完全关闭优化：
+`prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径，也不能写入非法的 engine/effort（非法值会退回你的草稿，再不行就丢弃）。
+
+AI 生成的方案会缓存在 `.tasks.prepare-cache.json`，以 `tasks.md` 的哈希为键。只要不修改 `tasks.md`，再次 `prepare`（或重启 loop）都会**复用该方案而不再调用 LLM**——即每次编辑只结构化一次，不会每轮重写，省 token。修改 `tasks.md` 即可重新规划；加 `--no-cache` 可强制刷新；用 `PREPARE_MODEL` 指定模型。想完全关闭优化：
 
 ```bash
 TASK_PREPARE_LLM=off ./auto-loop.sh prepare
