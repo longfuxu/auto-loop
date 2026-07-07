@@ -518,7 +518,11 @@ def main() -> int:
     except Exception as exc:
         if used_llm and draft_tasks:
             print(f"prepare: WARN LLM output rejected: {exc}; using deterministic draft", file=sys.stderr)
-            tasks = validate_payload({"tasks": draft_tasks})
+            try:
+                tasks = validate_payload({"tasks": draft_tasks})
+            except Exception as draft_exc:
+                print(f"prepare: {draft_exc}", file=sys.stderr)
+                return 1
             used_llm = False
             reused_cache = False
         else:
