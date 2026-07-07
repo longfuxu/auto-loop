@@ -28,7 +28,7 @@ Engine options:
 
 Model examples, passed through to the selected CLI:
 - Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
-- Codex: gpt-5-codex, gpt-5
+- Codex: gpt-5.5  (ChatGPT-plan accounts reject "-codex"-suffixed model names like gpt-5-codex)
 
 Effort examples:
 - Claude: low, medium, high, extra, max
