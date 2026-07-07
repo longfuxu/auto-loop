@@ -34,10 +34,14 @@
 #
 # Config: tasks.json (see tasks.example.json). Runtime state: state.json.
 # Logs: logs/. Reports: reports/. Lock: .auto-loop.lock.
-# Env overrides: ENGINE, MODEL, EFFORT, USAGE_LIMIT_THRESHOLD, PERM_FLAGS,
-#   IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS, CLAUDE_BIN, CLAUDE_RESUME_MODE,
+# Env overrides: ENGINE, ENGINE_FALLBACK, MODEL, EFFORT, USAGE_LIMIT_THRESHOLD,
+#   PERM_FLAGS, IDLE_SLEEP, RESET_BUFFER, MAX_ERRORS, CLAUDE_BIN, CLAUDE_RESUME_MODE,
 #   CODEX_BIN, CODEX_COOLDOWN, REQUIRE_GIT, AUDIT, AUDIT_MODEL, AUDIT_ENGINE,
 #   AUDIT_EFFORT, UI_PORT, EDITOR, TASKS_MD,
+#   (ENGINE_FALLBACK=0 pins each task to its primary engine — no switching to the
+#    fallback engine; the loop waits out the primary's usage window instead.)
+#   (CLAUDE_RESUME_MODE defaults to 'summary': resume the live session normally, but
+#    after a usage-limit window restart Claude fresh from summaries/<task>.md.)
 #   TASK_PREPARE_LLM (on[default]|auto|required|off — 'on' lets the AI restructure
 #     tasks.md, may set engine/model/effort, caches the plan so an unchanged file
 #     is not re-planned), PREPARE_MODEL, TASK_PREPARE_TIMEOUT, PREPARE_LLM_BIN.
@@ -56,8 +60,9 @@ PREPARE_SCRIPT="$ROOT/scripts/prepare_tasks.py"
 mkdir -p "$LOGDIR" "$REPORTDIR" "$SUMMARYDIR"
 
 ENGINE="${ENGINE:-claude}"             # default agent engine: claude | codex
+ENGINE_FALLBACK="${ENGINE_FALLBACK:-1}"  # 1 => rotate to the task's fallback engine when the active one is limited/failing; 0 => stay on primary only
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-CLAUDE_RESUME_MODE="${CLAUDE_RESUME_MODE:-full}"  # full | summary | fresh
+CLAUDE_RESUME_MODE="${CLAUDE_RESUME_MODE:-summary}"  # full | summary | fresh (default: summary)
 CODEX_BIN="${CODEX_BIN:-codex}"
 MODEL="${MODEL:-}"                     # empty -> per-task model, else account default
 EFFORT="${EFFORT:-}"                   # empty -> per-task/default CLI effort
@@ -81,6 +86,7 @@ die(){ log "FATAL: $*"; exit 1; }
 command -v jq >/dev/null || die "jq not found on PATH"
 [ -f "$TASKS" ] || [ -f "$TASKS_MD" ] || die "missing $TASKS — copy tasks.md.example to tasks.md and run ./auto-loop.sh prepare (or copy tasks.example.json to tasks.json)"
 case "$ENGINE" in claude|codex) : ;; *) die "ENGINE must be claude|codex, got '$ENGINE'";; esac
+case "$ENGINE_FALLBACK" in 0|1) : ;; *) die "ENGINE_FALLBACK must be 0 or 1, got '$ENGINE_FALLBACK'";; esac
 case "$CLAUDE_RESUME_MODE" in full|summary|fresh) : ;; *) die "CLAUDE_RESUME_MODE must be full|summary|fresh, got '$CLAUDE_RESUME_MODE'";; esac
 awk -v t="$USAGE_LIMIT_THRESHOLD" 'BEGIN{exit !(t > 0 && t <= 1)}' >/dev/null 2>&1 \
   || die "USAGE_LIMIT_THRESHOLD must be a number > 0 and <= 1, got '$USAGE_LIMIT_THRESHOLD'"
@@ -133,15 +139,22 @@ sset(){ local id="$1"; shift; jq --arg id "$id" "$@" "$STATE" | state_write; }  
 tget(){ jq -r --arg id "$1" ".tasks[]|select(.id==\$id)|.$2 // \"\"" "$TASKS"; }  # tget <id> <field>
 task_engine(){ local e; e="$(tget "$1" engine)"; [ -z "$e" ] && e="$ENGINE"; echo "$e"; }
 task_fallback_engine(){ local e; e="$(tget "$1" fallback_engine)"; echo "$e"; }
+task_fallback_enabled(){ [ "$ENGINE_FALLBACK" = "1" ]; }
 task_engine_spec(){
   local id="$1" primary fallback
   primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
-  [ -n "$fallback" ] && [ "$fallback" != "$primary" ] && printf '%s->%s' "$primary" "$fallback" || printf '%s' "$primary"
+  if task_fallback_enabled && [ -n "$fallback" ] && [ "$fallback" != "$primary" ]; then
+    printf '%s->%s' "$primary" "$fallback"
+  else
+    printf '%s' "$primary"
+  fi
 }
 task_engines(){
   local id="$1" primary fallback
-  primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
+  primary="$(task_engine "$id")"
   printf '%s\n' "$primary"
+  task_fallback_enabled || return 0
+  fallback="$(task_fallback_engine "$id")"
   [ -n "$fallback" ] && [ "$fallback" != "$primary" ] && printf '%s\n' "$fallback"
 }
 engine_ready(){
@@ -225,7 +238,7 @@ task_effort_spec(){
   local id="$1" primary fallback primary_eff fallback_eff
   primary="$(task_engine "$id")"; fallback="$(task_fallback_engine "$id")"
   primary_eff="$(task_effort_label_for_engine "$id" "$primary")"
-  if [ -n "$fallback" ] && [ "$fallback" != "$primary" ]; then
+  if task_fallback_enabled && [ -n "$fallback" ] && [ "$fallback" != "$primary" ]; then
     fallback_eff="$(task_effort_label_for_engine "$id" "$fallback")"
     printf '%s->%s' "$primary_eff" "$fallback_eff"
   else
@@ -257,7 +270,7 @@ switch_to_available_fallback(){
     [ "$e" = "$limited_engine" ] && continue
     if engine_available "$id" "$e" && engine_ready "$e"; then
       sset "$id" --arg e "$e" '.[$id].active_engine=$e'
-      log "[$id] $limited_engine is limited; continuing with fallback engine $e"
+      log "[$id] switching from $limited_engine to fallback engine $e"
       return 0
     fi
     engine_available "$id" "$e" && log "[$id] fallback engine $e is configured but CLI is not available"
@@ -644,6 +657,15 @@ apply_result(){
   if [ "$IS_ERROR" = "true" ]; then
     local n; n=$(( $(sget "$id" errors) + 1 ))
     sset "$id" --argjson n "$n" '.[$id].errors=$n'
+    # A hard (non-rate-limit) failure on one engine — e.g. a model the account cannot
+    # use — should not silently park a task the OTHER engine can still advance. If a
+    # fallback engine is enabled and free, rotate to it for the next run. MAX_ERRORS
+    # still bounds this, so two genuinely-broken engines eventually park the task.
+    if [ "$n" -lt "$MAX_ERRORS" ] && switch_to_available_fallback "$id" "$CUR_ENGINE"; then
+      log "[$id] $CUR_ENGINE errored (x$n) — rotating to the other engine for the next run"
+      write_task_summary "$id"
+      return
+    fi
     if [ "$n" -ge "$MAX_ERRORS" ]; then sset "$id" '.[$id].status="error"'; log "[$id] error x$n — parking task"
     else log "[$id] error x$n — will retry next pass"; fi
     return
@@ -693,6 +715,7 @@ write_report(){
 cmd_status(){
 	  init_state
 	  printf 'claude resume mode: %s\n' "$CLAUDE_RESUME_MODE"
+	  printf 'engine fallback: %s\n' "$([ "$ENGINE_FALLBACK" = "1" ] && echo 'on (primary -> fallback, and back when the other resets)' || echo 'off (primary engine only)')"
 	  printf 'usage reserve threshold: %s\n' "$USAGE_LIMIT_THRESHOLD"
 	  printf '\n%-24s %-14s %-10s %-7s %-12s %-5s %-4s %s\n' TASK ENGINE-SPEC EFFORT ACTIVE STATUS RUNS ERR SUMMARY
   printf '%-24s %-14s %-10s %-7s %-12s %-5s %-4s %s\n' ------------------------ -------------- ---------- ------- ------------ ----- ---- -------

@@ -79,7 +79,7 @@ Engine options:
 
 Model examples, passed through to the selected CLI:
 - Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
-- Codex: gpt-5-codex, gpt-5
+- Codex: gpt-5.5  （ChatGPT 套餐账户会拒绝带 -codex 后缀的名字，如 gpt-5-codex）
 
 Effort examples:
 - Claude: low, medium, high, extra, max
@@ -125,7 +125,7 @@ done:
 
 `prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径。
 
-非法或含糊的 `engine`/`model`/`effort` 会被**修复而不是直接拒绝**，让任务仍可运行：LLM 会映射到合法配置（如 `engine: gpt-5` → `engine: codex` 且 `model: gpt-5-codex`；`effort: very high` → 该引擎的最高档）。每条路径（含 `off`）都有确定性兜底：能识别的 engine 会被归一（`gpt`/`openai` → codex，`anthropic`/`opus`/`sonnet` → claude），effort 同义词改写成规范档位，实在无法校验的就丢弃，让 runner 用默认值继续，而不是启动失败。
+非法或含糊的 `engine`/`model`/`effort` 会被**修复而不是直接拒绝**，让任务仍可运行：LLM 会映射到合法配置（如 `engine: gpt-5.5` → `engine: codex`；`effort: very high` → 该引擎的最高档）。它不会凭空造出带 `-codex` 后缀的模型名（如 `gpt-5-codex`）——那类名字会被 ChatGPT 套餐的 Codex 账户拒绝；拿不准就把 model 留空、用账户默认。每条路径（含 `off`）都有确定性兜底：能识别的 engine 会被归一（`gpt`/`openai` → codex，`anthropic`/`opus`/`sonnet` → claude），effort 同义词改写成规范档位，实在无法校验的就丢弃，让 runner 用默认值继续，而不是启动失败。
 
 AI 生成的方案会缓存在 `.tasks.prepare-cache.json`，以 `tasks.md` 的哈希为键。只要不修改 `tasks.md`，再次 `prepare`（或重启 loop）都会**复用该方案而不再调用 LLM**——即每次编辑只结构化一次，不会每轮重写，省 token。修改 `tasks.md` 即可重新规划；加 `--no-cache` 可强制刷新；用 `PREPARE_MODEL` 指定模型。想完全关闭优化：
 
@@ -135,11 +135,13 @@ TASK_PREPARE_LLM=off ./auto-loop.sh prepare
 
 ## 引擎切换
 
-当 task 撞到 usage limit：
+切换是**双向、循环**的。当前 engine 撞到 usage limit 时：
 
 - Claude：能读到 `resetsAt` 时精确记录 reset 时间。
 - Codex：没有精确 reset epoch，所以用 `CODEX_COOLDOWN`。
-- 如果配置了可用的 `fallback_engine`，不会立刻睡觉，而是切到 fallback engine 继续。
+- 如果配置了当前可用的 `fallback_engine`，不会立刻睡觉，而是切到它继续。
+- 等这个 engine 也用完，只要 primary 的窗口已经 reset 就**切回 primary**；否则睡到两个 engine 里最早 reset 的那个。所以一个长任务会 `claude → codex → claude → …` 来回切，始终跑在还有额度的那个 engine 上。
+- **硬错误**（不是额度限制，例如账户用不了的模型）也会切到另一个 engine 再跑，而不是在坏掉的 engine 上把 `MAX_ERRORS` 耗光、把任务 park 掉。
 - fallback run 会看到本地 task summary，并被要求先检查 repo state 再继续。
 
 示例：
@@ -149,11 +151,15 @@ engine: claude
 model: claude-opus-4-8
 effort: extra
 fallback_engine: codex
-fallback_model: gpt-5-codex
+fallback_model: gpt-5.5
 fallback_effort: high
 ```
 
-含义：优先用 Claude 和指定模型/effort；Claude hit limit 后，Codex 接着做。
+含义：优先用 Claude 和指定模型/effort；Claude hit limit 后切到 Codex；Claude 窗口 reset 后再切回来。
+
+**模型注意：** ChatGPT 套餐的 Codex 账户请用 `gpt-5.5` 这类普通名字。带 `-codex` 后缀的名字（`gpt-5-codex`、`gpt-5.5-codex`）会被 `400 invalid_request_error` 拒绝，是 fallback「起不来」的常见原因。`fallback_model` 留空则用账户默认模型。
+
+**关掉切换：** 设 `ENGINE_FALLBACK=0`，每个任务只用 primary engine，撞 limit 就睡到 primary 的窗口 reset，而不切换。想只对单个任务关掉，则不写它的 `fallback_engine` 即可。
 
 ## 额度保留
 
@@ -167,14 +173,17 @@ USAGE_LIMIT_THRESHOLD=0.90 ./auto-loop.sh run
 
 ## 摘要恢复 / token management
 
+摘要恢复现在是**默认**行为（不用加 flag）：
+
 ```bash
-CLAUDE_RESUME_MODE=summary ./auto-loop.sh run
+./auto-loop.sh run            # 默认就是 summary 模式
+CLAUDE_RESUME_MODE=full ./auto-loop.sh run   # 想换回旧行为
 ```
 
 模式：
 
-- `full`：默认，继续使用保存的 session id。
-- `summary`：正常 resume；Claude hit limit 后，下一次 Claude run 用 `summaries/<task>.md` 开 fresh session。
+- `summary`（**默认**）：run 进行中正常 `--resume`；但 Claude 撞 limit、睡完窗口后，下一次 Claude run 用 `summaries/<task>.md` 开 fresh session，而不是 resume 一个可能已过期的 session id。
+- `full`：全程继续使用保存的 session id。
 - `fresh`：只要有 summary，就直接用 summary 开 fresh session。
 
 summary 包含 goal、done、最后一次结果、active engine、各 engine session id、最近 commit 等轻量上下文。
@@ -220,10 +229,11 @@ auditor 只能输出：
 
 ```bash
 ENGINE=claude
+ENGINE_FALLBACK=1          # 1 = 双向切换到 fallback engine；0 = 只用 primary
 MODEL=
 EFFORT=
 USAGE_LIMIT_THRESHOLD=0.90
-CLAUDE_RESUME_MODE=summary
+CLAUDE_RESUME_MODE=summary # full | summary | fresh（默认 summary）
 CODEX_COOLDOWN=3600
 AUDIT=1
 AUDIT_ENGINE=

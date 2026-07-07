@@ -79,7 +79,7 @@ Engine options:
 
 Model examples, passed through to the selected CLI:
 - Claude: claude-opus-4-8, claude-opus-4-6, claude-sonnet-4-5
-- Codex: gpt-5-codex, gpt-5
+- Codex: gpt-5.5  (ChatGPT-plan accounts reject "-codex"-suffixed names like gpt-5-codex)
 
 Effort examples:
 - Claude: low, medium, high, extra, max
@@ -125,17 +125,19 @@ Compile and validate:
 
 `prepare` parses Markdown deterministically, then — by default (`TASK_PREPARE_LLM=on`) — asks the configured CLI to rewrite each task into a more structured, auditable form: it polishes `goal` and `done` and may set or refine `engine`, `model`, and `effort` (and their `fallback_*` counterparts) to fit the task. The deterministic parser stays the source of truth for **task ids, directories, and task count** — the LLM can never invent a path, rename a task, or add/remove tasks.
 
-Bad or ambiguous `engine`/`model`/`effort` are **repaired, not just rejected**, so a task stays runnable. The LLM maps them to a valid working config (e.g. `engine: gpt-5` → `engine: codex` with `model: gpt-5-codex`; `effort: very high` → the engine's top tier). A deterministic safety net runs on every path (even `off`): it coerces a recognizable engine (`gpt`/`openai` → codex, `anthropic`/`opus`/`sonnet` → claude), rewrites effort synonyms to a canonical tier, and drops anything it still cannot validate so the runner falls back to its default instead of failing to start.
+Bad or ambiguous `engine`/`model`/`effort` are **repaired, not just rejected**, so a task stays runnable. The LLM maps them to a valid working config (e.g. `engine: gpt-5.5` → `engine: codex`; `effort: very high` → the engine's top tier). It never synthesizes a `-codex`-suffixed model name (e.g. `gpt-5-codex`), which ChatGPT-plan Codex accounts reject; when unsure it leaves the model blank so the CLI uses the account default. A deterministic safety net runs on every path (even `off`): it coerces a recognizable engine (`gpt`/`openai` → codex, `anthropic`/`opus`/`sonnet` → claude), rewrites effort synonyms to a canonical tier, and drops anything it still cannot validate so the runner falls back to its default instead of failing to start.
 
 The AI-written plan is cached in `.tasks.prepare-cache.json`, keyed by a hash of `tasks.md`. As long as you do not change `tasks.md`, re-running `prepare` (or restarting the loop) **reuses that plan without calling the LLM again** — so a task is structured once per edit, not re-planned on every run. This keeps the workflow token-efficient. Edit `tasks.md` to re-plan, pass `--no-cache` to force a refresh, or set `TASK_PREPARE_LLM=off` for deterministic-only output. Override the model with `PREPARE_MODEL`.
 
 ## Engine Fallback
 
-When a task hits a usage limit:
+Fallback is **bidirectional and cyclic**. When the active engine hits a usage limit:
 
 - Claude: the runner reads `resetsAt` when the CLI exposes it.
 - Codex: the runner uses `CODEX_COOLDOWN` because no precise reset epoch is exposed.
-- If `fallback_engine` is configured and available, the task continues immediately on that engine instead of sleeping.
+- If `fallback_engine` is configured and currently free, the task continues immediately on it instead of sleeping.
+- When that engine is later exhausted too, the task switches **back** to the primary if its window has reset; otherwise the loop sleeps until whichever engine resets first. So a long task ping-pongs `claude → codex → claude → …`, always running on whichever engine has quota.
+- A **hard error** (not a usage limit) — e.g. a model the account cannot use — also rotates to the other engine for the next run, instead of burning `MAX_ERRORS` on the broken one and parking the task.
 - `state.json` stores separate sessions under `sessions.claude` and `sessions.codex`.
 - The fallback run receives the local task summary and must inspect the repo state before continuing.
 
@@ -146,11 +148,15 @@ engine: claude
 model: claude-opus-4-8
 effort: extra
 fallback_engine: codex
-fallback_model: gpt-5-codex
+fallback_model: gpt-5.5
 fallback_effort: high
 ```
 
-This means: start with Claude, use that model and effort if available, and continue with Codex if Claude is limited.
+This means: start with Claude, use that model and effort if available, and continue with Codex if Claude is limited (and back to Claude once its window resets).
+
+**Model note:** on a ChatGPT-plan Codex account, use plain model names like `gpt-5.5`. The `-codex`-suffixed names (`gpt-5-codex`, `gpt-5.5-codex`) are rejected with `400 invalid_request_error` and are a common cause of a fallback that "can't start". Leave `fallback_model` blank to inherit the account default.
+
+**Opting out:** set `ENGINE_FALLBACK=0` to pin every task to its primary engine — the loop then waits out the primary's usage window instead of switching. Per task, simply omit `fallback_engine` to disable fallback for that task only.
 
 ## Usage Reserve
 
@@ -164,17 +170,20 @@ When the active CLI exposes utilization and reaches this threshold, the current 
 
 ## Summary Resume
 
-Claude can resume the same non-interactive session with `--resume`. Long sessions can become expensive in context. `auto-loop` adds harness-level summary resume:
+Claude can resume the same non-interactive session with `--resume`. Long sessions can become expensive in context, and a session id can expire while the loop sleeps out a multi-hour usage window. `auto-loop` adds harness-level summary resume, and it is now the **default**:
 
 ```bash
-CLAUDE_RESUME_MODE=summary ./auto-loop.sh run
+# default behavior — no flag needed
+./auto-loop.sh run
+# force a different mode
+CLAUDE_RESUME_MODE=full ./auto-loop.sh run
 ```
 
 Modes:
 
-- `full`: default, keep using the stored session id.
-- `summary`: use normal resume until a Claude usage limit occurs; next Claude run starts fresh from `summaries/<task>.md`.
-- `fresh`: always use the local summary when one exists.
+- `summary` (**default**): use normal `--resume` while a run streams, but after a Claude usage-limit window, start the next Claude run fresh from `summaries/<task>.md` instead of resuming a possibly-stale session id.
+- `full`: keep using the stored session id across everything.
+- `fresh`: always start from the local summary when one exists.
 
 The summary file contains task goal, done criteria, last result, active engine, sessions by engine, and recent commits.
 
@@ -228,10 +237,11 @@ Useful environment variables:
 
 ```bash
 ENGINE=claude              # default primary engine when a task omits engine
+ENGINE_FALLBACK=1          # 1 = rotate to the fallback engine (both ways); 0 = primary only
 MODEL=                     # default model when a task omits model
 EFFORT=                    # default effort when a task omits effort
 USAGE_LIMIT_THRESHOLD=0.90 # reserve usage headroom when utilization is exposed
-CLAUDE_RESUME_MODE=summary # full | summary | fresh
+CLAUDE_RESUME_MODE=summary # full | summary | fresh (default: summary)
 CODEX_COOLDOWN=3600        # fallback wait for Codex usage limits
 AUDIT=1                    # require independent audit
 AUDIT_ENGINE=              # override auditor engine
