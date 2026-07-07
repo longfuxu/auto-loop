@@ -107,6 +107,7 @@ done:
 
 - `id`：默认来自 `##` 标题，也可以显式写 `id:`；必须匹配 `^[a-z0-9-]+$`。
 - `dir`：绝对路径，指向一个 git repo 或 worktree。
+- `brief`：可选，一句话描述任务意图。**用它替代 `goal`/`done`**，让 prepare 帮你写出完整规范（见下方「Brief 模式」）。若同时写了显式 `goal`/`done`，则以显式为准，`brief` 仅作为溯源保留。
 - `goal`：任务目标。
 - `done`：可验证完成标准，最好写具体命令和文件。
 - `engine`：可选，`claude` 或 `codex`；不填用 `$ENGINE`，再不填默认 `claude`。
@@ -123,7 +124,24 @@ done:
 ./auto-loop.sh validate
 ```
 
-`prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径。
+### Brief 模式：只描述一次，`/goal` 帮你写规范
+
+手写严谨的 `goal`/`done` 是最费时的一步。改成只给基本信息 + 一句话 `brief`：
+
+```md
+## ship-a-dark-mode-toggle
+
+dir: /absolute/path/to/a/git/repo
+engine: claude
+effort: high
+
+brief:
+给设置页加一个深色模式开关：把选择持久化到 localStorage，默认跟随系统偏好，且不引入新依赖。
+```
+
+默认（`TASK_PREPARE_LLM=on`）下，prepare 会按 [Codex `/goal`](https://github.com/openai/codex) 方法论把这段 brief 展开成完整规范——**Objective**、**Scope**（in/out）、**Constraints**、**Stop if**、**Token budget** 写入 `goal`，可机器校验的 **Done when** 清单写入 `done`。你只需描述一次意图，agent 就会产出 runner 和 auditor 需要的可验证规范。运行前可用 `./auto-loop.sh prepare && ./auto-loop.sh doctor` 审阅生成结果。LLM 关闭或不可达时，brief 仍可运行——`goal` 退化为 brief 原文、`done` 退化为通用清单——任务绝不会因此起不来。
+
+`prepare` 先用确定性 parser 解析 Markdown，然后默认（`TASK_PREPARE_LLM=on`）让所配置的 CLI 把每个 task 改写成更结构化、更可审计的形式：把任意 `brief` 展开成上面的 `/goal` 规范、润色 `goal` / `done`，并可以按任务需要设置或调整 `engine`、`model`、`effort`（以及对应的 `fallback_*`）。**task 数量、id、dir** 始终以确定性 parser 为准——LLM 不能新增/删除 task、改名、编造路径。
 
 非法或含糊的 `engine`/`model`/`effort` 会被**修复而不是直接拒绝**，让任务仍可运行：LLM 会映射到合法配置（如 `engine: gpt-5` → `engine: codex` 且 `model: gpt-5-codex`；`effort: very high` → 该引擎的最高档）。每条路径（含 `off`）都有确定性兜底：能识别的 engine 会被归一（`gpt`/`openai` → codex，`anthropic`/`opus`/`sonnet` → claude），effort 同义词改写成规范档位，实在无法校验的就丢弃，让 runner 用默认值继续，而不是启动失败。
 

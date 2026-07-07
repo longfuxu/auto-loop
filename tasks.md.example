@@ -17,6 +17,33 @@ file's hash), so an unchanged `tasks.md` is structured once and not re-planned o
 later runs. Set `TASK_PREPARE_LLM=off` for deterministic-only output. The final
 JSON is still validated before a loop can start.
 
+## Two ways to write a task
+
+1. **Full form** — you write `goal:` and `done:` yourself (examples further down).
+2. **Brief form (recommended)** — you write just the basics (`dir`, optionally
+   `engine`/`model`/`effort`) plus a one-line `brief:` describing what you want.
+   With `TASK_PREPARE_LLM=on` (the default), prepare expands that brief into a full
+   Codex-`/goal`-style contract: an **Objective**, **Scope** (in/out), **Constraints**,
+   **Stop if** conditions, and a **Token budget** go into `goal`, and a verifiable
+   **Done when** checklist goes into `done`. You describe intent once; the agent
+   writes the rigorous spec. Review the generated spec anytime with
+   `./auto-loop.sh prepare && ./auto-loop.sh doctor` before running.
+
+   `id` and `dir` always stay yours — the LLM never invents or repoints them. With
+   the LLM off (or unreachable), a brief still runs: `goal` falls back to the brief
+   text and `done` to a generic checklist, so nothing hard-fails.
+
+## ship-a-dark-mode-toggle
+
+dir: /absolute/path/to/a/git/repo
+engine: claude
+effort: high
+fallback_engine: codex
+
+brief:
+Add a dark-mode toggle to the settings page: persist the choice to localStorage
+and default to the system preference. Keep it dependency-free.
+
 ## my-feature
 
 dir: /absolute/path/to/a/git/repo

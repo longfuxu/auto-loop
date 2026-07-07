@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Prepare auto-loop tasks.json from a human-editable tasks.md file."""
+"""Prepare auto-loop tasks.json from a human-editable tasks.md file.
+
+A task may be written in full (explicit `goal` + `done`) or as a `brief`: a
+one-line description of intent. With the LLM prepare step on (the default),
+a brief is expanded into a full Codex-`/goal`-style contract — Objective,
+Scope, Constraints, Stop-if and a Token budget in `goal`, plus a verifiable
+Done-when checklist in `done`. `id` and `dir` always stay human-owned; with the
+LLM off a brief still degrades to a runnable goal/done so nothing hard-fails.
+"""
 
 from __future__ import annotations
 
@@ -17,12 +25,14 @@ from pathlib import Path
 
 ENGINE_VALUES = {"claude", "codex"}
 FIELD_RE = re.compile(
-    r"^(id|dir|goal|done|engine|model|effort|fallback_engine|fallback_model|fallback_effort)\s*:\s*(.*)$",
+    r"^(id|dir|brief|goal|done|engine|model|effort|fallback_engine|fallback_model|fallback_effort)\s*:\s*(.*)$",
     re.I,
 )
 # A model string is passed straight to the CLI's --model flag: keep it to a safe token.
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-CACHE_VERSION = 1
+# Bump whenever the prepared-task semantics change (e.g. brief -> /goal expansion),
+# so caches written by an older prepare are not reused with new meaning.
+CACHE_VERSION = 2
 # Effort tokens auto-loop.sh normalize_effort_for_engine accepts verbatim (space-normalized).
 # A value in this set is kept as written; anything else is rewritten to a canonical token
 # via normalize_effort so the runner never rejects it.
@@ -106,6 +116,7 @@ def normalize_task(task: dict, index: int) -> dict:
 
     for key in (
         "dir",
+        "brief",
         "goal",
         "done",
         "engine",
@@ -130,6 +141,36 @@ def normalize_task(task: dict, index: int) -> dict:
             # so a bad engine is repaired rather than silently dropped.
             value = value.lower()
         out[key] = value
+    return out
+
+
+# Deterministic done-criteria used only as a fallback when the user gave a brief but
+# no explicit done and the LLM /goal expansion is unavailable (off / no key / errored).
+# It keeps the task runnable and non-empty; the LLM path replaces it with a real,
+# per-task checklist. Kept generic on purpose — a brief has no verifiable specifics.
+BRIEF_FALLBACK_DONE = (
+    "Implement exactly what the brief describes and COMMIT it on a feature branch; "
+    "the repo still builds and its available test/lint command passes; "
+    "the brief's stated intent is objectively satisfied (name the concrete artifact "
+    "or command that proves it)."
+)
+
+
+def fill_from_brief(tasks: list[dict]) -> list[dict]:
+    """Make a brief-only task runnable without an LLM: when a task carries a `brief`
+    but is missing `goal`/`done`, seed provisional values from the brief so the
+    deterministic path still validates. The LLM /goal expansion, when enabled,
+    overwrites these with a proper Objective/Scope/Constraints/Done-when spec."""
+    out: list[dict] = []
+    for task in tasks:
+        item = dict(task)
+        brief = (item.get("brief") or "").strip()
+        if brief:
+            if not (item.get("goal") or "").strip():
+                item["goal"] = brief
+            if not (item.get("done") or "").strip():
+                item["done"] = BRIEF_FALLBACK_DONE
+        out.append(item)
     return out
 
 
@@ -168,7 +209,7 @@ def parse_markdown(text: str) -> list[dict]:
         if current is None:
             continue
 
-        subheading = re.match(r"^###\s+(goal|done)\s*$", stripped, re.I)
+        subheading = re.match(r"^###\s+(brief|goal|done)\s*$", stripped, re.I)
         if subheading:
             flush_block()
             block_key = subheading.group(1).lower()
@@ -180,7 +221,7 @@ def parse_markdown(text: str) -> list[dict]:
             key = field.group(1).lower()
             value = field.group(2)
             flush_block()
-            if key in {"goal", "done"}:
+            if key in {"brief", "goal", "done"}:
                 block_key = key
                 block_lines = [value] if value else []
             else:
@@ -247,7 +288,10 @@ def validate_payload(payload: dict) -> list[dict]:
         item = normalize_task(task, i)
         for key in ("id", "dir", "goal", "done"):
             if not item.get(key):
-                raise ValueError(f"task #{i} missing required field: {key}")
+                raise ValueError(
+                    f"task #{i} missing required field: {key} "
+                    "(provide goal+done explicitly, or a `brief` for /goal auto-expansion)"
+                )
         if item["id"] in seen:
             raise ValueError(f"duplicate task id: {item['id']}")
         seen.add(item["id"])
@@ -272,8 +316,13 @@ def guard_llm_tasks(tasks: list[dict], draft_tasks: list[dict]) -> list[dict]:
                 item[key] = draft[key]
             else:
                 item.pop(key, None)
-        # engine/model/effort (+fallbacks): keep the LLM's value, else the human's.
-        for key in ("engine", "model", "effort", "fallback_engine", "fallback_model", "fallback_effort"):
+        # brief + engine/model/effort (+fallbacks): keep the LLM's value, else the
+        # human draft's. brief is provenance only (the runner reads goal/done);
+        # preserving it keeps the source description visible in tasks.json even when
+        # the LLM omits it. (goal/done are already validated as non-empty before this
+        # runs — a partial LLM result is rejected earlier and falls back to the
+        # brief-seeded deterministic draft.)
+        for key in ("brief", "engine", "model", "effort", "fallback_engine", "fallback_model", "fallback_effort"):
             if not item.get(key):
                 if draft.get(key):
                     item[key] = draft[key]
@@ -370,7 +419,7 @@ def llm_optimize(markdown: str, draft_tasks: list[dict], args: argparse.Namespac
     prompt = f"""You convert a human-written auto-loop task Markdown file into canonical tasks.json.
 
 Return ONLY a JSON object with this exact shape:
-{{"tasks":[{{"id":"slug","dir":"/absolute/path","goal":"...","done":"...","engine":"claude|codex","model":"optional","effort":"optional","fallback_engine":"claude|codex","fallback_model":"optional","fallback_effort":"optional"}}]}}
+{{"tasks":[{{"id":"slug","dir":"/absolute/path","brief":"optional","goal":"...","done":"...","engine":"claude|codex","model":"optional","effort":"optional","fallback_engine":"claude|codex","fallback_model":"optional","fallback_effort":"optional"}}]}}
 
 Rules:
 - Preserve explicit task ids when they are valid slugs. If an id is invalid, minimally slugify it.
@@ -383,12 +432,25 @@ Rules:
 - Prefer named output artifacts and concrete verification commands when implied by the task.
 - You MAY set or refine engine/model/effort (and their fallback_* counterparts) to fit the task, but keep the human's explicit choice unless there is a clear reason to change it. Use ONLY engine "claude" or "codex"; effort for claude is one of low|medium|high|extra|max, effort for codex is one of light|medium|high|"extra high".
 - REPAIR bad or ambiguous values into a valid, working configuration — do not just drop them. If the human wrote an engine you do not recognize, infer the right one and keep the original as the model when it names one: e.g. engine "gpt-5"/"gpt-5-codex"/"openai" -> engine "codex" (model "gpt-5-codex" if that is what they meant); engine "claude-opus"/"anthropic"/"sonnet" -> engine "claude". Map effort synonyms to the nearest valid tier (e.g. "very high"/"maximum" -> claude "max" or codex "extra high"; "minimal" -> "low"). Only omit engine/model/effort when you truly have no basis to set them.
-- Output JSON only. No markdown. No commentary.
+
+/goal EXPANSION (the important part):
+- A task may give only a short "brief" (a one-or-two-line description of intent) instead of a fully written goal/done. When it does, EXPAND that brief into a complete, self-contained goal contract using the Codex /goal methodology. This is the whole point — the human writes one line, you write the rigorous spec.
+- Put the expanded spec in "goal" as structured Markdown with these exact section headers, filling every one:
+    **Objective** — one sentence, one concrete deliverable. Forbidden vague verbs: improve, all, thoroughly, better, optimize, clean up, refactor (alone). Use add/remove/replace/migrate/implement/produce.
+    **Scope** — "In scope:" and "Out of scope:" lines naming files/dirs/systems (relative to the task dir). Never say "all relevant files"; name them or describe them concretely.
+    **Constraints** — hard, mechanically-checkable rules specific to THIS task's domain (e.g. "No new top-level dependencies", "Public API of module X unchanged").
+    **Stop if** — machine-recognizable stop conditions (e.g. "More than 3 files outside Scope need edits", "A Constraints rule would have to be violated"). No conditions that need human judgment.
+    **Token budget** — "Use a token budget of <N> tokens." Default 80000; lower for surgical fixes, higher for migrations/large refactors.
+- Put the "Done when" checklist in "done" as GitHub-style `- [ ]` items, each objectively verifiable with a file path or a shell command (e.g. "`pytest tests/x.py -q` exits 0", "`grep -R 'TODO' src/` returns nothing"). Never "tests pass" without naming the test; never a proxy signal (lint score, test count) instead of the actual deliverable.
+- Base Scope/Constraints/Done strictly on the brief and the task's dir. Do NOT fabricate file paths, commands, or facts you cannot reasonably infer; when a path is unknown, describe the target instead of inventing one.
+- Do NOT restate the loop's own git/safety rules (work on a feature branch, never touch main, don't print secrets, an auditor verifies you). Those are enforced separately — keep Constraints focused on the task's domain.
+- If the human already wrote an explicit goal AND done (not just a brief), keep their intent and only lightly polish/structure them — do not regenerate from scratch.
+- Output JSON only. No markdown fences. No commentary.
 
 Human Markdown:
 {markdown}
 
-Deterministic parser draft:
+Deterministic parser draft (brief-only tasks show "goal" echoing the brief and a placeholder "done" — REPLACE both with a proper /goal expansion):
 {json.dumps({"tasks": draft_tasks}, ensure_ascii=False, indent=2)}
 """
     cmd = [bin_path, "-p", prompt]
@@ -476,7 +538,9 @@ def main() -> int:
         return 1
 
     markdown = markdown_path.read_text(encoding="utf-8")
-    draft_tasks = parse_markdown(markdown)
+    # Seed provisional goal/done from any `brief` so a brief-only task stays runnable
+    # even with the LLM off; the LLM /goal expansion (default on) overwrites these.
+    draft_tasks = fill_from_brief(parse_markdown(markdown))
     if not draft_tasks and not llm_enabled:
         print("prepare: no tasks parsed from Markdown", file=sys.stderr)
         return 1

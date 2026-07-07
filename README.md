@@ -107,6 +107,7 @@ Fields:
 
 - `id`: taken from the `##` heading unless `id:` is provided. Must match `^[a-z0-9-]+$`.
 - `dir`: absolute path to a git repo or worktree.
+- `brief`: optional one-line description of intent. Provide this **instead of** `goal`/`done` to let prepare write the full spec for you (see "Brief form" below). If you also give an explicit `goal`/`done`, those win and the brief is kept only as provenance.
 - `goal`: concrete objective.
 - `done`: objective verification criteria. Name commands and artifacts.
 - `engine`: optional primary engine, `claude` or `codex`. Defaults to `$ENGINE`, then `claude`.
@@ -123,7 +124,25 @@ Compile and validate:
 ./auto-loop.sh validate
 ```
 
-`prepare` parses Markdown deterministically, then — by default (`TASK_PREPARE_LLM=on`) — asks the configured CLI to rewrite each task into a more structured, auditable form: it polishes `goal` and `done` and may set or refine `engine`, `model`, and `effort` (and their `fallback_*` counterparts) to fit the task. The deterministic parser stays the source of truth for **task ids, directories, and task count** — the LLM can never invent a path, rename a task, or add/remove tasks.
+### Brief form: describe once, `/goal` writes the spec
+
+Writing a rigorous `goal`/`done` by hand is the slow part. Instead, give the basics and a one-line `brief`:
+
+```md
+## ship-a-dark-mode-toggle
+
+dir: /absolute/path/to/a/git/repo
+engine: claude
+effort: high
+
+brief:
+Add a dark-mode toggle to the settings page: persist the choice to localStorage
+and default to the system preference. Keep it dependency-free.
+```
+
+With `TASK_PREPARE_LLM=on` (the default), prepare expands that brief into a full [Codex `/goal`](https://github.com/openai/codex)-style contract — an **Objective**, **Scope** (in/out), **Constraints**, **Stop if** conditions, and a **Token budget** land in `goal`, and a verifiable **Done when** checklist lands in `done`. You state intent once; the agent produces the mechanically-verifiable spec the runner and auditor need. Inspect the generated spec before running with `./auto-loop.sh prepare && ./auto-loop.sh doctor`. With the LLM off or unreachable, a brief still runs — `goal` falls back to the brief text and `done` to a generic checklist — so a task never hard-fails to start.
+
+`prepare` parses Markdown deterministically, then — by default (`TASK_PREPARE_LLM=on`) — asks the configured CLI to rewrite each task into a more structured, auditable form: it expands any `brief` into the `/goal` spec above, polishes `goal` and `done`, and may set or refine `engine`, `model`, and `effort` (and their `fallback_*` counterparts) to fit the task. The deterministic parser stays the source of truth for **task ids, directories, and task count** — the LLM can never invent a path, rename a task, or add/remove tasks.
 
 Bad or ambiguous `engine`/`model`/`effort` are **repaired, not just rejected**, so a task stays runnable. The LLM maps them to a valid working config (e.g. `engine: gpt-5` → `engine: codex` with `model: gpt-5-codex`; `effort: very high` → the engine's top tier). A deterministic safety net runs on every path (even `off`): it coerces a recognizable engine (`gpt`/`openai` → codex, `anthropic`/`opus`/`sonnet` → claude), rewrites effort synonyms to a canonical tier, and drops anything it still cannot validate so the runner falls back to its default instead of failing to start.
 
